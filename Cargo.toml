@@ -27,6 +27,7 @@ csv = "1.2"
 egui = "0.31.1"
 eframe = "0.31.1"
 rfd = "0.15.3"
+network-interface = "2.0.1"
 
 
 [target.'cfg(windows)'.dependencies]

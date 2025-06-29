@@ -7,8 +7,7 @@ use anyhow::Result;
 use byteorder::{BigEndian, ByteOrder};
 use chrono::{DateTime, Utc};
 use log::{debug, error, info, warn};
-use pnet::datalink;
-use pnet::ipnetwork::IpNetwork;
+use network_interface::{NetworkInterface as NetInterface, NetworkInterfaceConfig};
 use rand::prelude::*;
 use rand::rngs::StdRng; // This is Send-compatible
 use socket2::{Domain, Protocol, Socket, Type};
@@ -286,30 +285,41 @@ impl DhcpManager {
     }
 
     /// Get available network interfaces
+    /// Get available network interfaces
     pub fn get_network_interfaces() -> Result<Vec<NetworkInterface>, DhcpError> {
         let mut interfaces = Vec::new();
 
-        for interface in datalink::interfaces() {
-            let mut ipv4_addr = None;
-            let mut mac_addr = None;
+        let network_interfaces = NetInterface::show().map_err(|e| {
+            DhcpError::Network(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to enumerate network interfaces: {}", e),
+            ))
+        })?;
+
+        for interface in network_interfaces {
+            // Skip loopback and interfaces without addresses
+            if interface.name.starts_with("lo") || interface.addr.is_empty() {
+                continue;
+            }
 
             // Extract IPv4 address
-            for ip in &interface.ips {
-                if let IpNetwork::V4(ipv4_net) = ip {
-                    ipv4_addr = Some(ipv4_net.ip());
-                    break;
+            let mut ipv4_addr = None;
+            for addr in &interface.addr {
+                if let std::net::IpAddr::V4(ip) = addr.ip() {
+                    // Skip loopback IPs
+                    if !ip.is_loopback() {
+                        ipv4_addr = Some(ip);
+                        break;
+                    }
                 }
             }
 
             // Extract MAC address
-            if let Some(mac) = interface.mac {
-                let mac_bytes = mac.octets();
-                if mac_bytes.len() == 6 {
-                    let mut mac_array = [0u8; 6];
-                    mac_array.copy_from_slice(&mac_bytes);
-                    mac_addr = Some(mac_array);
-                }
-            }
+            let mac_addr = if let Some(mac_str) = &interface.mac_addr {
+                Self::parse_mac_address(mac_str).ok()
+            } else {
+                None
+            };
 
             if let Some(ipv4) = ipv4_addr {
                 interfaces.push(NetworkInterface {
@@ -321,6 +331,26 @@ impl DhcpManager {
         }
 
         Ok(interfaces)
+    }
+
+    /// Parse MAC address from string format (e.g., "aa:bb:cc:dd:ee:ff")
+    fn parse_mac_address(mac_str: &str) -> Result<[u8; 6], DhcpError> {
+        let parts: Vec<&str> = mac_str.split(':').collect();
+        if parts.len() != 6 {
+            return Err(DhcpError::Address(format!(
+                "Invalid MAC address format: {}",
+                mac_str
+            )));
+        }
+
+        let mut mac = [0u8; 6];
+        for (i, part) in parts.iter().enumerate() {
+            mac[i] = u8::from_str_radix(part, 16).map_err(|_| {
+                DhcpError::Address(format!("Invalid MAC address format: {}", mac_str))
+            })?;
+        }
+
+        Ok(mac)
     }
 
     /// Configure the DHCP server
