@@ -1,0 +1,47 @@
+[package]
+name = "axis_config"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full", "fs"] }
+socket2 = { version = "0.5", features = ["all"] }
+pnet = "0.35.0"
+ipnetwork = "0.21.1"
+rand = {version = "0.9.1", features = ["std_rng"]}
+log = "0.4"
+env_logger = "0.11.8"
+anyhow = "1.0"
+thiserror = "2.0.12"
+parking_lot = "0.12"
+byteorder = "1.5"
+serde = { version = "1.0", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart"] }
+surge-ping = "0.8"  # Alternative to subprocess ping
+url = "2.5"
+base64 = "0.22"  # For HTTP digest auth if needed
+tokio-util = "0.7"
+serde_json = "1.0"
+csv = "1.2"
+egui = "0.31.1"
+eframe = "0.31.1"
+rfd = "0.15.3"
+
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winsock2", "ws2def", "iphlpapi"] }
+
+[target.'cfg(windows)'.rustflags]
+rustflags = ["-C", "link-args=/SUBSYSTEM:WINDOWS"]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# === For macOS App Bundling ===
+[package.metadata.bundle]
+name = "Axis Config Tool" # This will be the name shown in Finder
+identifier = "com.tylans.axisconfigtool" # Unique reverse domain identifier
+icon = ["icon.icns"] # Optional: Path to your macOS icon file
+resources = [] # Optional: List of additional files to include in the bundle
+category = "Productivity" # Optional: App category
