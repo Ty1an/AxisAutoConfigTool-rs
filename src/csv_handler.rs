@@ -6,11 +6,11 @@
 //! 2. Generating inventory reports of configured cameras
 //! 3. Creating sample CSV templates for users
 
-use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
-use csv::{Reader, ReaderBuilder, Writer, WriterBuilder};
-use log::{error, info, warn};
-use serde::{Deserialize, Serialize};
+use anyhow::{ Context, Result };
+use chrono::{ DateTime, Utc };
+use csv::{ Reader, ReaderBuilder, Writer, WriterBuilder };
+use log::{ error, info, warn };
+use serde::{ Deserialize, Serialize };
 use std::collections::HashSet;
 use std::fs::File;
 use std::net::Ipv4Addr;
@@ -20,38 +20,43 @@ use thiserror::Error;
 /// Custom error types for CSV operations
 #[derive(Error, Debug)]
 pub enum CsvError {
-    #[error("File not found: {path}")]
-    FileNotFound { path: String },
+    #[error("File not found: {path}")] FileNotFound {
+        path: String,
+    },
 
-    #[error("Duplicate IP addresses found: {ips}")]
-    DuplicateIps { ips: String },
+    #[error("Duplicate IP addresses found: {ips}")] DuplicateIps {
+        ips: String,
+    },
 
-    #[error("Duplicate MAC addresses found: {macs}")]
-    DuplicateMacs { macs: String },
+    #[error("Duplicate MAC addresses found: {macs}")] DuplicateMacs {
+        macs: String,
+    },
 
-    #[error("Invalid IP address format: {ip}")]
-    InvalidIp { ip: String },
+    #[error("Invalid IP address format: {ip}")] InvalidIp {
+        ip: String,
+    },
 
-    #[error("Invalid MAC address format: {mac}")]
-    InvalidMac { mac: String },
+    #[error("Invalid MAC address format: {mac}")] InvalidMac {
+        mac: String,
+    },
 
-    #[error("CSV parsing error: {message}")]
-    ParseError { message: String },
+    #[error("CSV parsing error: {message}")] ParseError {
+        message: String,
+    },
 
-    #[error("Validation error: {message}")]
-    ValidationError { message: String },
+    #[error("Validation error: {message}")] ValidationError {
+        message: String,
+    },
 
-    #[error("Invalid network configuration: {message}")]
-    InvalidNetworkConfig { message: String },
+    #[error("Invalid network configuration: {message}")] InvalidNetworkConfig {
+        message: String,
+    },
 
-    #[error("CSV error: {0}")]
-    Csv(#[from] csv::Error),
+    #[error("CSV error: {0}")] Csv(#[from] csv::Error),
 
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("IO error: {0}")] Io(#[from] std::io::Error),
 
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+    #[error("Serialization error: {0}")] Serialization(#[from] serde_json::Error),
 }
 
 /// IP configuration for CSV input
@@ -62,7 +67,7 @@ pub struct IpAssignment {
 }
 
 /// Camera data structure for inventory reports
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CameraInventoryData {
     /// Final IP address assigned to camera
     pub final_ip: String,
@@ -168,7 +173,7 @@ impl CsvHandler {
     /// - Verifies column headers match expected format
     pub fn read_ip_list<P: AsRef<Path>>(
         &self,
-        file_path: P,
+        file_path: P
     ) -> Result<Vec<IpAssignment>, CsvError> {
         let path_str = file_path.as_ref().to_string_lossy().to_string();
 
@@ -177,10 +182,7 @@ impl CsvHandler {
         }
 
         let file = File::open(&file_path)?;
-        let mut reader = ReaderBuilder::new()
-            .has_headers(true)
-            .flexible(true)
-            .from_reader(file);
+        let mut reader = ReaderBuilder::new().has_headers(true).flexible(true).from_reader(file);
 
         let headers = reader.headers()?.clone();
         let header_strings: Vec<String> = headers
@@ -191,12 +193,14 @@ impl CsvHandler {
         info!("CSV headers found: {:?}", header_strings);
 
         // Determine if this is MAC-specific format
-        let has_mac = header_strings.contains(&"mac".to_string())
-            || header_strings.contains(&"macaddress".to_string());
+        let has_mac =
+            header_strings.contains(&"mac".to_string()) ||
+            header_strings.contains(&"macaddress".to_string());
 
         // Validate required headers
-        let has_ip = header_strings.contains(&"ip".to_string())
-            || header_strings.contains(&"finalipaddress".to_string());
+        let has_ip =
+            header_strings.contains(&"ip".to_string()) ||
+            header_strings.contains(&"finalipaddress".to_string());
 
         if !has_ip {
             return Err(CsvError::ValidationError {
@@ -204,13 +208,15 @@ impl CsvHandler {
             });
         }
 
-        if has_mac
-            && !(header_strings.contains(&"mac".to_string())
-                || header_strings.contains(&"macaddress".to_string()))
+        if
+            has_mac &&
+            !(
+                header_strings.contains(&"mac".to_string()) ||
+                header_strings.contains(&"macaddress".to_string())
+            )
         {
             return Err(CsvError::ValidationError {
-                message: "CSV file appears to be MAC-specific but is missing a 'MAC' column"
-                    .to_string(),
+                message: "CSV file appears to be MAC-specific but is missing a 'MAC' column".to_string(),
             });
         }
 
@@ -240,10 +246,7 @@ impl CsvHandler {
 
             // Validate IP address format
             if let Err(e) = ip.parse::<Ipv4Addr>() {
-                warn!(
-                    "Skipping row {}: Invalid IP address '{}': {}",
-                    row_number, ip, e
-                );
+                warn!("Skipping row {}: Invalid IP address '{}': {}", row_number, ip, e);
                 row_number += 1;
                 continue;
             }
@@ -257,7 +260,8 @@ impl CsvHandler {
                         if !self.validate_mac_format(&cleaned_mac) {
                             warn!(
                                 "Skipping row {}: Invalid MAC address format '{}'",
-                                row_number, cleaned_mac
+                                row_number,
+                                cleaned_mac
                             );
                             row_number += 1;
                             continue;
@@ -287,11 +291,7 @@ impl CsvHandler {
         // Perform comprehensive validation
         self.validate_assignments(&results)?;
 
-        info!(
-            "Successfully validated and read {} IP assignments from {}",
-            results.len(),
-            path_str
-        );
+        info!("Successfully validated and read {} IP assignments from {}", results.len(), path_str);
 
         Ok(results)
     }
@@ -299,31 +299,37 @@ impl CsvHandler {
     /// Read sequential IP assignment list from CSV file
     pub fn read_sequential_ip_list<P: AsRef<Path>>(
         &self,
-        file_path: P,
+        file_path: P
     ) -> Result<Vec<String>, CsvError> {
         let assignments = self.read_ip_list(file_path)?;
 
         if let Some(first) = assignments.first() {
             if first.mac.is_some() {
-                warn!("CSV appears to be in MAC-specific format, but sequential was requested. Using IP addresses only.");
+                warn!(
+                    "CSV appears to be in MAC-specific format, but sequential was requested. Using IP addresses only."
+                );
             }
         }
 
-        Ok(assignments.into_iter().map(|a| a.ip).collect())
+        Ok(
+            assignments
+                .into_iter()
+                .map(|a| a.ip)
+                .collect()
+        )
     }
 
     /// Read MAC-specific IP assignment list from CSV file
     pub fn read_mac_specific_ip_list<P: AsRef<Path>>(
         &self,
-        file_path: P,
+        file_path: P
     ) -> Result<std::collections::HashMap<String, String>, CsvError> {
         let assignments = self.read_ip_list(file_path)?;
 
         // Verify this is actually MAC-specific format
         if assignments.iter().any(|a| a.mac.is_none()) {
             return Err(CsvError::ValidationError {
-                message: "CSV file is not in MAC-specific format (missing MAC address column)"
-                    .to_string(),
+                message: "CSV file is not in MAC-specific format (missing MAC address column)".to_string(),
             });
         }
 
@@ -337,207 +343,161 @@ impl CsvHandler {
         Ok(mac_to_ip)
     }
 
-   /// Write comprehensive inventory report to CSV file
-///
-/// Creates a detailed report containing:
-/// - Camera identification (IPs, MACs, serials, names)
-/// - Configuration status for each operation performed
-/// - Firmware version information
-/// - Login credentials used
-/// - Timestamp information for tracking purposes
-/// - Tool version information for record-keeping
-pub fn write_inventory_report<P: AsRef<Path>>(
-    &self,
-    file_path: P,
-    camera_data: &[CameraInventoryData],
-) -> Result<(), CsvError> {
-    if camera_data.is_empty() {
-        return Err(CsvError::ValidationError {
-            message: "No camera data provided for inventory report".to_string(),
-        });
-    }
-
-    let file = File::create(&file_path)?;
-    let mut writer = WriterBuilder::new().has_headers(true).from_writer(file);
-
-    // Write header
-    writer.write_record(&[
-        "final_ip",
-        "temp_ip",
-        "mac",
-        "verified_mac",
-        "serial",
-        "camera_name",
-        "firmware_version",
-        "admin_username",
-        "onvif_username",
-        "status",
-        "create_admin_success",
-        "create_admin_message",
-        "create_admin_timestamp",
-        "create_onvif_user_success",
-        "create_onvif_user_message",
-        "create_onvif_user_timestamp",
-        "set_static_ip_success",
-        "set_static_ip_message",
-        "set_static_ip_timestamp",
-        "upgrade_firmware_success",
-        "upgrade_firmware_message",
-        "upgrade_firmware_timestamp",
-        "report_generated",
-        "tool_version",
-    ])?;
-
-    // Write data rows
-    for camera in camera_data {
-        let ops = &camera.operations;
-
-        // Create string values for all fields to avoid reference issues
-        let temp_ip_str = camera.temp_ip.as_deref().unwrap_or("").to_string();
-        let mac_str = camera.mac.as_deref().unwrap_or("").to_string();
-        let verified_mac_str = camera.verified_mac.as_deref().unwrap_or("").to_string();
-        let serial_str = camera.serial.as_deref().unwrap_or("").to_string();
-        let camera_name_str = camera.camera_name.as_deref().unwrap_or("").to_string();
-        let firmware_version_str = camera.firmware_version.as_deref().unwrap_or("").to_string();
-        let admin_username_str = camera.admin_username.as_deref().unwrap_or("").to_string();
-        let onvif_username_str = camera.onvif_username.as_deref().unwrap_or("").to_string();
-
-        // Create operation result strings
-        let create_admin_success = ops.create_admin
-            .as_ref()
-            .map(|op| op.success.to_string())
-            .unwrap_or_default();
-        let create_admin_message = ops.create_admin
-            .as_ref()
-            .map(|op| op.message.clone())
-            .unwrap_or_default();
-        let create_admin_timestamp = ops.create_admin
-            .as_ref()
-            .map(|op| op.timestamp.to_rfc3339())
-            .unwrap_or_default();
-
-        let create_onvif_user_success = ops.create_onvif_user
-            .as_ref()
-            .map(|op| op.success.to_string())
-            .unwrap_or_default();
-        let create_onvif_user_message = ops.create_onvif_user
-            .as_ref()
-            .map(|op| op.message.clone())
-            .unwrap_or_default();
-        let create_onvif_user_timestamp = ops.create_onvif_user
-            .as_ref()
-            .map(|op| op.timestamp.to_rfc3339())
-            .unwrap_or_default();
-
-        let set_static_ip_success = ops.set_static_ip
-            .as_ref()
-            .map(|op| op.success.to_string())
-            .unwrap_or_default();
-        let set_static_ip_message = ops.set_static_ip
-            .as_ref()
-            .map(|op| op.message.clone())
-            .unwrap_or_default();
-        let set_static_ip_timestamp = ops.set_static_ip
-            .as_ref()
-            .map(|op| op.timestamp.to_rfc3339())
-            .unwrap_or_default();
-
-        let upgrade_firmware_success = ops.upgrade_firmware
-            .as_ref()
-            .map(|op| op.success.to_string())
-            .unwrap_or_default();
-        let upgrade_firmware_message = ops.upgrade_firmware
-            .as_ref()
-            .map(|op| op.message.clone())
-            .unwrap_or_default();
-        let upgrade_firmware_timestamp = ops.upgrade_firmware
-            .as_ref()
-            .map(|op| op.timestamp.to_rfc3339())
-            .unwrap_or_default();
-
-        writer.write_record(&[
-            &camera.final_ip,
-            &temp_ip_str,
-            &mac_str,
-            &verified_mac_str,
-            &serial_str,
-            &camera_name_str,
-            &firmware_version_str,
-            &admin_username_str,
-            &onvif_username_str,
-            &camera.status,
-            &create_admin_success,
-            &create_admin_message,
-            &create_admin_timestamp,
-            &create_onvif_user_success,
-            &create_onvif_user_message,
-            &create_onvif_user_timestamp,
-            &set_static_ip_success,
-            &set_static_ip_message,
-            &set_static_ip_timestamp,
-            &upgrade_firmware_success,
-            &upgrade_firmware_message,
-            &upgrade_firmware_timestamp,
-            &camera.report_generated.to_rfc3339(),
-            &camera.tool_version,
-        ])?;
-    }
-
-    writer.flush()?;
-
-    info!(
-        "Wrote inventory report for {} cameras to {}",
-        camera_data.len(),
-        file_path.as_ref().to_string_lossy()
-    );
-
-    Ok(())
-}
-    /// Create a sample CSV file with IP addresses for testing
-    pub fn create_sample_csv<P: AsRef<Path>>(
+    /// Write comprehensive inventory report to CSV file
+    ///
+    /// Creates a detailed report containing:
+    /// - Camera identification (IPs, MACs, serials, names)
+    /// - Configuration status for each operation performed
+    /// - Firmware version information
+    /// - Login credentials used
+    /// - Timestamp information for tracking purposes
+    /// - Tool version information for record-keeping
+    pub fn write_inventory_report<P: AsRef<Path>>(
         &self,
         file_path: P,
-        mode: SampleMode,
-        count: usize,
-        base_ip: &str,
+        camera_data: &[CameraInventoryData]
     ) -> Result<(), CsvError> {
-        let base_addr = base_ip
-            .parse::<Ipv4Addr>()
-            .map_err(|_| CsvError::InvalidIp {
-                ip: base_ip.to_string(),
-            })?;
-
-        let octets = base_addr.octets();
-        let base_last_octet = octets[3] as usize;
-        let ip_prefix = format!("{}.{}.{}", octets[0], octets[1], octets[2]);
+        if camera_data.is_empty() {
+            return Err(CsvError::ValidationError {
+                message: "No camera data provided for inventory report".to_string(),
+            });
+        }
 
         let file = File::create(&file_path)?;
         let mut writer = WriterBuilder::new().has_headers(true).from_writer(file);
 
-        match mode {
-            SampleMode::Sequential => {
-                writer.write_record(&["IP"])?;
-                for i in 0..count {
-                    let ip = format!("{}.{}", ip_prefix, base_last_octet + i);
-                    writer.write_record(&[&ip])?;
-                }
-            }
-            SampleMode::MacSpecific => {
-                writer.write_record(&["IP", "MAC"])?;
-                for i in 0..count {
-                    let ip = format!("{}.{}", ip_prefix, base_last_octet + i);
-                    let mac = format!("00408C{:02X}{:02X}{:02X}", i % 256, (i + 10) % 256, (i + 20) % 256);
-                    writer.write_record(&[&ip, &mac])?;
-                }
-            }
+        // Write header
+        writer.write_record(
+            &[
+                "final_ip",
+                "temp_ip",
+                "mac",
+                "verified_mac",
+                "serial",
+                "camera_name",
+                "firmware_version",
+                "admin_username",
+                "onvif_username",
+                "status",
+                "create_admin_success",
+                "create_admin_message",
+                "create_admin_timestamp",
+                "create_onvif_user_success",
+                "create_onvif_user_message",
+                "create_onvif_user_timestamp",
+                "set_static_ip_success",
+                "set_static_ip_message",
+                "set_static_ip_timestamp",
+                "upgrade_firmware_success",
+                "upgrade_firmware_message",
+                "upgrade_firmware_timestamp",
+                "report_generated",
+                "tool_version",
+            ]
+        )?;
+
+        // Write data rows
+        for camera in camera_data {
+            let ops = &camera.operations;
+
+            // Create string values for all fields to avoid reference issues
+            let temp_ip_str = camera.temp_ip.as_deref().unwrap_or("").to_string();
+            let mac_str = camera.mac.as_deref().unwrap_or("").to_string();
+            let verified_mac_str = camera.verified_mac.as_deref().unwrap_or("").to_string();
+            let serial_str = camera.serial.as_deref().unwrap_or("").to_string();
+            let camera_name_str = camera.camera_name.as_deref().unwrap_or("").to_string();
+            let firmware_version_str = camera.firmware_version.as_deref().unwrap_or("").to_string();
+            let admin_username_str = camera.admin_username.as_deref().unwrap_or("").to_string();
+            let onvif_username_str = camera.onvif_username.as_deref().unwrap_or("").to_string();
+
+            // Create operation result strings
+            let create_admin_success = ops.create_admin
+                .as_ref()
+                .map(|op| op.success.to_string())
+                .unwrap_or_default();
+            let create_admin_message = ops.create_admin
+                .as_ref()
+                .map(|op| op.message.clone())
+                .unwrap_or_default();
+            let create_admin_timestamp = ops.create_admin
+                .as_ref()
+                .map(|op| op.timestamp.to_rfc3339())
+                .unwrap_or_default();
+
+            let create_onvif_user_success = ops.create_onvif_user
+                .as_ref()
+                .map(|op| op.success.to_string())
+                .unwrap_or_default();
+            let create_onvif_user_message = ops.create_onvif_user
+                .as_ref()
+                .map(|op| op.message.clone())
+                .unwrap_or_default();
+            let create_onvif_user_timestamp = ops.create_onvif_user
+                .as_ref()
+                .map(|op| op.timestamp.to_rfc3339())
+                .unwrap_or_default();
+
+            let set_static_ip_success = ops.set_static_ip
+                .as_ref()
+                .map(|op| op.success.to_string())
+                .unwrap_or_default();
+            let set_static_ip_message = ops.set_static_ip
+                .as_ref()
+                .map(|op| op.message.clone())
+                .unwrap_or_default();
+            let set_static_ip_timestamp = ops.set_static_ip
+                .as_ref()
+                .map(|op| op.timestamp.to_rfc3339())
+                .unwrap_or_default();
+
+            let upgrade_firmware_success = ops.upgrade_firmware
+                .as_ref()
+                .map(|op| op.success.to_string())
+                .unwrap_or_default();
+            let upgrade_firmware_message = ops.upgrade_firmware
+                .as_ref()
+                .map(|op| op.message.clone())
+                .unwrap_or_default();
+            let upgrade_firmware_timestamp = ops.upgrade_firmware
+                .as_ref()
+                .map(|op| op.timestamp.to_rfc3339())
+                .unwrap_or_default();
+
+            writer.write_record(
+                &[
+                    &camera.final_ip,
+                    &temp_ip_str,
+                    &mac_str,
+                    &verified_mac_str,
+                    &serial_str,
+                    &camera_name_str,
+                    &firmware_version_str,
+                    &admin_username_str,
+                    &onvif_username_str,
+                    &camera.status,
+                    &create_admin_success,
+                    &create_admin_message,
+                    &create_admin_timestamp,
+                    &create_onvif_user_success,
+                    &create_onvif_user_message,
+                    &create_onvif_user_timestamp,
+                    &set_static_ip_success,
+                    &set_static_ip_message,
+                    &set_static_ip_timestamp,
+                    &upgrade_firmware_success,
+                    &upgrade_firmware_message,
+                    &upgrade_firmware_timestamp,
+                    &camera.report_generated.to_rfc3339(),
+                    &camera.tool_version,
+                ]
+            )?;
         }
 
         writer.flush()?;
 
         info!(
-            "Created sample CSV file with {} entries in {:?} mode at {}",
-            count,
-            mode,
+            "Wrote inventory report for {} cameras to {}",
+            camera_data.len(),
             file_path.as_ref().to_string_lossy()
         );
 
@@ -547,7 +507,12 @@ pub fn write_inventory_report<P: AsRef<Path>>(
     // Private helper methods
 
     /// Extract field value from CSV record
-    fn extract_field(&self, record: &csv::StringRecord, headers: &csv::StringRecord, field_names: &[&str]) -> Option<String> {
+    fn extract_field(
+        &self,
+        record: &csv::StringRecord,
+        headers: &csv::StringRecord,
+        field_names: &[&str]
+    ) -> Option<String> {
         for field_name in field_names {
             for (i, header) in headers.iter().enumerate() {
                 if header.to_lowercase().trim() == field_name.to_lowercase() {
@@ -616,7 +581,10 @@ pub fn write_inventory_report<P: AsRef<Path>>(
 
         // Verify IP subnet consistency
         if assignments.len() > 1 {
-            let ips: Vec<_> = assignments.iter().map(|a| &a.ip).collect();
+            let ips: Vec<_> = assignments
+                .iter()
+                .map(|a| &a.ip)
+                .collect();
             if let Err(e) = self.verify_ip_subnet_consistency(&ips) {
                 warn!("IP subnet consistency check failed: {}", e);
             }
@@ -661,25 +629,21 @@ pub fn write_inventory_report<P: AsRef<Path>>(
             return Ok(());
         }
 
-        let first_ip = ip_addresses[0]
-            .parse::<Ipv4Addr>()
-            .map_err(|e| CsvError::InvalidIp {
-                ip: format!("{}: {}", ip_addresses[0], e),
-            })?;
+        let first_ip = ip_addresses[0].parse::<Ipv4Addr>().map_err(|e| CsvError::InvalidIp {
+            ip: format!("{}: {}", ip_addresses[0], e),
+        })?;
 
-        let first_network = u32::from(first_ip) & 0xFFFFFF00; // /24 network
+        let first_network = u32::from(first_ip) & 0xffffff00; // /24 network
 
         for ip_str in &ip_addresses[1..] {
             let ip = ip_str.parse::<Ipv4Addr>().map_err(|e| CsvError::InvalidIp {
                 ip: format!("{}: {}", ip_str, e),
             })?;
 
-            let network = u32::from(ip) & 0xFFFFFF00; // /24 network
+            let network = u32::from(ip) & 0xffffff00; // /24 network
 
             if network != first_network {
-                warn!(
-                    "IP addresses span multiple subnets - this might cause connectivity issues"
-                );
+                warn!("IP addresses span multiple subnets - this might cause connectivity issues");
                 break;
             }
         }
@@ -692,144 +656,4 @@ impl Default for CsvHandler {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Sample CSV generation modes
-#[derive(Debug, Clone, Copy)]
-pub enum SampleMode {
-    Sequential,
-    MacSpecific,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-
-    #[test]
-    fn test_csv_handler_creation() {
-        let _handler = CsvHandler::new();
-        // Just verify it can be created
-        assert!(true);
-    }
-
-    #[test]
-    fn test_mac_validation() {
-        let handler = CsvHandler::new();
-
-        // Valid MACs
-        assert!(handler.validate_mac_format("00408C123456"));
-        assert!(handler.validate_mac_format("00:40:8C:12:34:56"));
-        assert!(handler.validate_mac_format("00-40-8C-12-34-56"));
-
-        // Invalid MACs
-        assert!(!handler.validate_mac_format("00408C12345"));  // Too short
-        assert!(!handler.validate_mac_format("00408C1234567")); // Too long
-        assert!(!handler.validate_mac_format("00408G123456"));  // Invalid character
-    }
-
-    #[test]
-    fn test_mac_normalization() {
-        let handler = CsvHandler::new();
-
-        assert_eq!(handler.normalize_mac("00:40:8C:12:34:56"), "00408C123456");
-        assert_eq!(handler.normalize_mac("00-40-8c-12-34-56"), "00408C123456");
-        assert_eq!(handler.normalize_mac("00408c123456"), "00408C123456");
-    }
-
-    #[test]
-    fn test_sample_csv_creation() {
-        let handler = CsvHandler::new();
-        let temp_path = "test_sample.csv";
-
-        // Test sequential mode
-        let result = handler.create_sample_csv(
-            temp_path,
-            SampleMode::Sequential,
-            3,
-            "192.168.1.100",
-        );
-        assert!(result.is_ok());
-
-        // Verify content
-        let content = fs::read_to_string(temp_path).unwrap();
-        assert!(content.contains("IP"));
-        assert!(content.contains("192.168.1.100"));
-        assert!(content.contains("192.168.1.101"));
-        assert!(content.contains("192.168.1.102"));
-
-        // Clean up
-        let _ = fs::remove_file(temp_path);
-    }
-
-    #[test]
-    fn test_mac_specific_sample_csv() {
-        let handler = CsvHandler::new();
-        let temp_path = "test_mac_sample.csv";
-
-        let result = handler.create_sample_csv(
-            temp_path,
-            SampleMode::MacSpecific,
-            2,
-            "192.168.1.100",
-        );
-        assert!(result.is_ok());
-
-        let content = fs::read_to_string(temp_path).unwrap();
-        assert!(content.contains("IP,MAC"));
-        assert!(content.contains("192.168.1.100"));
-        assert!(content.contains("00408C"));
-
-        // Clean up
-        let _ = fs::remove_file(temp_path);
-    }
-}
-
-/// Example usage of the CSV handler
-pub async fn example_usage() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
-
-    let handler = CsvHandler::new();
-
-    // Create a sample CSV file
-    handler.create_sample_csv(
-        "sample_ips.csv",
-        SampleMode::Sequential,
-        5,
-        "192.168.1.100",
-    )?;
-
-    // Read the IP list
-    let ip_assignments = handler.read_ip_list("sample_ips.csv")?;
-    println!("Read {} IP assignments", ip_assignments.len());
-
-    // Create sample camera inventory data
-    let camera_data = vec![
-        CameraInventoryData {
-            final_ip: "192.168.1.101".to_string(),
-            temp_ip: Some("169.254.1.1".to_string()),
-            mac: Some("00408C123456".to_string()),
-            verified_mac: Some("00408C123456".to_string()),
-            serial: Some("ACCC12345678".to_string()),
-            camera_name: Some("Camera-01".to_string()),
-            firmware_version: Some("10.12.100".to_string()),
-            admin_username: Some("root".to_string()),
-            onvif_username: Some("onvif_user".to_string()),
-            status: "Success".to_string(),
-            operations: OperationResults {
-                create_admin: Some(OperationResult::success("Admin user created")),
-                create_onvif_user: Some(OperationResult::success("ONVIF user created")),
-                set_static_ip: Some(OperationResult::success("Static IP set")),
-                upgrade_firmware: Some(OperationResult::success("Firmware upgraded")),
-            },
-            report_generated: Utc::now(),
-            tool_version: "1.0.0".to_string(),
-        },
-    ];
-
-    // Write inventory report
-    handler.write_inventory_report("camera_inventory.csv", &camera_data)?;
-    println!("Wrote inventory report to camera_inventory.csv");
-
-    Ok(())
 }

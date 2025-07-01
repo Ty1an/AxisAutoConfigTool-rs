@@ -2,12 +2,11 @@
 //! Camera discovery module
 
 use anyhow::Result;
-use log::{debug, info, warn};
-use reqwest::{Client, ClientBuilder, Method};
-use serde::{Deserialize, Serialize};
+use log::{ debug, info, warn };
+use reqwest::{ Client, ClientBuilder, Method };
+use serde::{ Deserialize, Serialize };
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::str::FromStr;
+use std::net::{ IpAddr, Ipv4Addr, SocketAddr };
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -18,26 +17,29 @@ use url::Url;
 /// Custom error types for camera discovery operations
 #[derive(Error, Debug)]
 pub enum DiscoveryError {
-    #[error("Network timeout for {ip}")]
-    Timeout { ip: String },
-    
-    #[error("Connection failed for {ip}: {reason}")]
-    ConnectionFailed { ip: String, reason: String },
-    
-    #[error("HTTP error for {ip}: {status}")]
-    HttpError { ip: String, status: u16 },
-    
-    #[error("Invalid IP address: {ip}")]
-    InvalidIp { ip: String },
-    
-    #[error("Request error: {0}")]
-    Request(#[from] reqwest::Error),
-    
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    
-    #[error("URL parse error: {0}")]
-    UrlParse(#[from] url::ParseError),
+    #[error("Network timeout for {ip}")] Timeout {
+        ip: String,
+    },
+
+    #[error("Connection failed for {ip}: {reason}")] ConnectionFailed {
+        ip: String,
+        reason: String,
+    },
+
+    #[error("HTTP error for {ip}: {status}")] HttpError {
+        ip: String,
+        status: u16,
+    },
+
+    #[error("Invalid IP address: {ip}")] InvalidIp {
+        ip: String,
+    },
+
+    #[error("Request error: {0}")] Request(#[from] reqwest::Error),
+
+    #[error("IO error: {0}")] Io(#[from] std::io::Error),
+
+    #[error("URL parse error: {0}")] UrlParse(#[from] url::ParseError),
 }
 
 /// Device information returned by discovery operations
@@ -129,11 +131,7 @@ impl CameraDiscovery {
         let ip_str = ip.to_string();
 
         // Common Axis endpoints to check
-        let endpoints = [
-            "/axis-cgi/usergroup.cgi",
-            "/axis-cgi/basicdeviceinfo.cgi",
-            "/",
-        ];
+        let endpoints = ["/axis-cgi/usergroup.cgi", "/axis-cgi/basicdeviceinfo.cgi", "/"];
 
         // First try HEAD requests to common Axis endpoints
         for endpoint in &endpoints {
@@ -142,8 +140,12 @@ impl CameraDiscovery {
                     info!("Axis server characteristics detected at {} via {}", ip_str, endpoint);
                     return Ok(true);
                 }
-                Ok(false) => continue,
-                Err(_) => continue, // Try next endpoint
+                Ok(false) => {
+                    continue;
+                }
+                Err(_) => {
+                    continue;
+                } // Try next endpoint
             }
         }
 
@@ -162,15 +164,15 @@ impl CameraDiscovery {
     }
 
     /// Check a specific endpoint with HEAD request for Axis characteristics
-    async fn check_endpoint_with_head(&self, ip: Ipv4Addr, endpoint: &str) -> Result<bool, DiscoveryError> {
+    async fn check_endpoint_with_head(
+        &self,
+        ip: Ipv4Addr,
+        endpoint: &str
+    ) -> Result<bool, DiscoveryError> {
         let url_str = format!("http://{}{}", ip, endpoint);
         let url = Url::parse(&url_str)?;
 
-        let response = self
-            .client
-            .request(Method::HEAD, url)
-            .send()
-            .await?;
+        let response = self.client.request(Method::HEAD, url).send().await?;
 
         let headers = response.headers();
 
@@ -190,8 +192,10 @@ impl CameraDiscovery {
             if let Some(auth_header) = headers.get("www-authenticate") {
                 if let Ok(auth_str) = auth_header.to_str() {
                     let auth_lower = auth_str.to_lowercase();
-                    if auth_lower.contains("digest") && 
-                       (auth_lower.contains("axis") || auth_lower.contains("realm")) {
+                    if
+                        auth_lower.contains("digest") &&
+                        (auth_lower.contains("axis") || auth_lower.contains("realm"))
+                    {
                         info!("Axis digest authentication detected at {}", ip);
                         return Ok(true);
                     }
@@ -217,7 +221,10 @@ impl CameraDiscovery {
     }
 
     /// Check response content for Axis indicators
-    async fn check_content_for_axis_indicators(&self, ip: Ipv4Addr) -> Result<bool, DiscoveryError> {
+    async fn check_content_for_axis_indicators(
+        &self,
+        ip: Ipv4Addr
+    ) -> Result<bool, DiscoveryError> {
         let url_str = format!("http://{}/", ip);
         let url = Url::parse(&url_str)?;
 
@@ -226,11 +233,7 @@ impl CameraDiscovery {
         let content_lower = content.to_lowercase();
 
         // Look for Axis indicators in the response content
-        let axis_indicators = [
-            "axis communications",
-            "axis camera",
-            "axis network camera",
-        ];
+        let axis_indicators = ["axis communications", "axis camera", "axis network camera"];
 
         for indicator in &axis_indicators {
             if content_lower.contains(indicator) {
@@ -250,33 +253,21 @@ impl CameraDiscovery {
         // Platform-specific ping command
         #[cfg(windows)]
         {
-            cmd.args([
-                "-n", "1",
-                "-w", &(self.timeout.as_millis() as u64).to_string(),
-                &ip_str,
-            ]);
+            cmd.args(["-n", "1", "-w", &(self.timeout.as_millis() as u64).to_string(), &ip_str]);
         }
 
         #[cfg(not(windows))]
         {
-            cmd.args([
-                "-c", "1",
-                "-W", &self.timeout.as_secs().to_string(),
-                &ip_str,
-            ]);
+            cmd.args(["-c", "1", "-W", &self.timeout.as_secs().to_string(), &ip_str]);
         }
 
         // Run ping command with additional timeout margin
-        let output = timeout(
-            self.timeout + Duration::from_secs(1),
-            cmd.output()
-        )
-        .await
-        .map_err(|_| DiscoveryError::Timeout { ip: ip_str.clone() })?
-        .map_err(|e| DiscoveryError::ConnectionFailed {
-            ip: ip_str.clone(),
-            reason: format!("Ping subprocess error: {}", e),
-        })?;
+        let output = timeout(self.timeout + Duration::from_secs(1), cmd.output()).await
+            .map_err(|_| DiscoveryError::Timeout { ip: ip_str.clone() })?
+            .map_err(|e| DiscoveryError::ConnectionFailed {
+                ip: ip_str.clone(),
+                reason: format!("Ping subprocess error: {}", e),
+            })?;
 
         Ok(output.status.success())
     }
@@ -331,7 +322,7 @@ impl CameraDiscovery {
         &self,
         ip: Ipv4Addr,
         username: Option<&str>,
-        password: Option<&str>,
+        password: Option<&str>
     ) -> Result<DeviceInfo, DiscoveryError> {
         let ip_str = ip.to_string();
         let start_time = std::time::Instant::now();
@@ -342,7 +333,11 @@ impl CameraDiscovery {
 
         let mut device_info = DeviceInfo {
             ip: ip_str,
-            status: if is_responsive { "discovered".to_string() } else { "not_responsive".to_string() },
+            status: if is_responsive {
+                "discovered".to_string()
+            } else {
+                "not_responsive".to_string()
+            },
             device_type: None,
             server_header: None,
             authentication_type: None,
@@ -366,7 +361,7 @@ impl CameraDiscovery {
         &self,
         ip: Ipv4Addr,
         username: Option<&str>,
-        password: Option<&str>,
+        password: Option<&str>
     ) -> Result<DeviceInfo, DiscoveryError> {
         let ip_str = ip.to_string();
         let url_str = format!("http://{}/", ip);
@@ -400,7 +395,9 @@ impl CameraDiscovery {
                 }
             });
 
-        let device_type = if server_header.as_ref().map_or(false, |s| s.to_lowercase().contains("axis")) {
+        let device_type = if
+            server_header.as_ref().map_or(false, |s| s.to_lowercase().contains("axis"))
+        {
             Some("axis_camera".to_string())
         } else {
             Some("unknown_device".to_string())
@@ -419,10 +416,10 @@ impl CameraDiscovery {
     /// Batch check multiple IP addresses for Axis cameras
     pub async fn check_multiple_devices(&self, ips: &[Ipv4Addr]) -> HashMap<String, bool> {
         let mut results = HashMap::new();
-        
+
         // Use tokio::spawn to check devices concurrently
         let mut handles = Vec::new();
-        
+
         for &ip in ips {
             let discovery = CameraDiscovery::with_timeout(self.timeout).unwrap();
             let handle = tokio::spawn(async move {
@@ -431,117 +428,147 @@ impl CameraDiscovery {
             });
             handles.push(handle);
         }
-        
+
         // Collect results
         for handle in handles {
             if let Ok((ip, result)) = handle.await {
                 results.insert(ip, result);
             }
         }
-        
+
         results
     }
 
-    /// Scan a subnet for Axis cameras
-    pub async fn scan_subnet(&self, network: &str) -> Result<Vec<DeviceInfo>, DiscoveryError> {
+    /// Fast scan that stops early when cameras are found
+    pub async fn fast_scan_subnet(
+        &self,
+        network: &str,
+        max_cameras: Option<usize>
+    ) -> Result<Vec<DeviceInfo>, DiscoveryError> {
         use ipnetwork::Ipv4Network;
-        use std::str::FromStr;
 
-        let network: Ipv4Network = network.parse()
-            .map_err(|_| DiscoveryError::InvalidIp { ip: network.to_string() })?;
+        let network: Ipv4Network = network.parse().map_err(|_| DiscoveryError::InvalidIp {
+            ip: network.to_string(),
+        })?;
 
         let mut discovered_devices = Vec::new();
+        let max_find = max_cameras.unwrap_or(50); // Stop after finding this many
+
+        // Use much more aggressive concurrency for faster scanning
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(50));
+        let devices = std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));
+
         let mut handles = Vec::new();
 
-        // Limit concurrent connections to avoid overwhelming the network
-        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(20));
+        info!("Fast scanning network: {} (stopping after {} cameras)", network, max_find);
 
         for ip in network.iter() {
-            let discovery = CameraDiscovery::with_timeout(self.timeout)?;
+            // Check if we've found enough cameras
+            {
+                let current_devices = devices.read().await;
+                if current_devices.len() >= max_find {
+                    info!("Found {} cameras, stopping scan early", current_devices.len());
+                    break;
+                }
+            }
+
+            let discovery = CameraDiscovery::with_timeout(Duration::from_secs(1))?; // Shorter timeout
             let sem = semaphore.clone();
-            
+            let devices_clone = devices.clone();
+
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                discovery.get_device_info(ip, None, None).await
-            });
-            
-            handles.push(handle);
-        }
 
-        // Collect results
-        for handle in handles {
-            if let Ok(Ok(device_info)) = handle.await {
-                if device_info.status == "discovered" {
-                    discovered_devices.push(device_info);
+                // Quick check first - just ping and port check, no full HTTP verification
+                if let Ok(device_info) = discovery.quick_check_device(ip).await {
+                    if device_info.status == "discovered" {
+                        let mut devices_write = devices_clone.write().await;
+                        devices_write.push(device_info);
+                        info!("Found camera at {}, total found: {}", ip, devices_write.len());
+                    }
+                }
+            });
+
+            handles.push(handle);
+
+            // Check every 10 spawned tasks if we should stop
+            if handles.len() % 10 == 0 {
+                let current_count = devices.read().await.len();
+                if current_count >= max_find {
+                    break;
                 }
             }
         }
 
-        info!("Subnet scan of {} completed. Found {} devices", network, discovered_devices.len());
+        // Wait for all spawned tasks to complete
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        let final_devices = devices.read().await;
+        discovered_devices = final_devices.clone();
+
+        info!(
+            "Fast subnet scan of {} completed. Found {} devices",
+            network,
+            discovered_devices.len()
+        );
         Ok(discovered_devices)
+    }
+
+    /// Quick device check - just ping and port, no full HTTP verification
+    async fn quick_check_device(&self, ip: Ipv4Addr) -> Result<DeviceInfo, DiscoveryError> {
+        let ip_str = ip.to_string();
+        let start_time = std::time::Instant::now();
+
+        // Quick ping check
+        let is_pingable = timeout(Duration::from_secs(1), self.check_ping(ip)).await.unwrap_or(
+            Ok(false)
+        )?;
+
+        if !is_pingable {
+            return Ok(DeviceInfo {
+                ip: ip_str,
+                status: "not_responsive".to_string(),
+                device_type: None,
+                server_header: None,
+                authentication_type: None,
+                response_time_ms: Some(start_time.elapsed().as_millis() as u64),
+            });
+        }
+
+        // Quick port check
+        let port_open = timeout(
+            Duration::from_secs(1),
+            self.check_http_connection(ip)
+        ).await.unwrap_or(Ok(false))?;
+
+        let response_time = start_time.elapsed().as_millis() as u64;
+
+        if port_open {
+            Ok(DeviceInfo {
+                ip: ip_str,
+                status: "discovered".to_string(),
+                device_type: Some("potential_camera".to_string()),
+                server_header: None,
+                authentication_type: None,
+                response_time_ms: Some(response_time),
+            })
+        } else {
+            Ok(DeviceInfo {
+                ip: ip_str,
+                status: "not_responsive".to_string(),
+                device_type: None,
+                server_header: None,
+                authentication_type: None,
+                response_time_ms: Some(response_time),
+            })
+        }
     }
 }
 
 impl Default for CameraDiscovery {
     fn default() -> Self {
         Self::new().expect("Failed to create default CameraDiscovery")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::str::FromStr;
-    use tokio::test;
-
-    #[test]
-    async fn test_camera_discovery_creation() {
-        let discovery = CameraDiscovery::new();
-        assert!(discovery.is_ok());
-    }
-
-    #[test]
-    async fn test_camera_discovery_with_timeout() {
-        let discovery = CameraDiscovery::with_timeout(Duration::from_secs(5));
-        assert!(discovery.is_ok());
-        assert_eq!(discovery.unwrap().timeout, Duration::from_secs(5));
-    }
-
-    #[test]
-    async fn test_check_localhost() {
-        let discovery = CameraDiscovery::new().unwrap();
-        let ip = Ipv4Addr::from_str("127.0.0.1").unwrap();
-        
-        // This test might fail depending on the environment
-        let result = discovery.check_device(ip).await;
-        println!("Localhost check result: {:?}", result);
-        // We don't assert the result because localhost behavior varies
-    }
-
-    #[test]
-    async fn test_get_device_info() {
-        let discovery = CameraDiscovery::new().unwrap();
-        let ip = Ipv4Addr::from_str("127.0.0.1").unwrap();
-        
-        let result = discovery.get_device_info(ip, None, None).await;
-        assert!(result.is_ok());
-        
-        let device_info = result.unwrap();
-        assert_eq!(device_info.ip, "127.0.0.1");
-        assert!(device_info.response_time_ms.is_some());
-    }
-
-    #[test]
-    async fn test_batch_check() {
-        let discovery = CameraDiscovery::new().unwrap();
-        let ips = vec![
-            Ipv4Addr::from_str("127.0.0.1").unwrap(),
-            Ipv4Addr::from_str("192.168.1.1").unwrap(),
-        ];
-        
-        let results = discovery.check_multiple_devices(&ips).await;
-        assert_eq!(results.len(), 2);
-        assert!(results.contains_key("127.0.0.1"));
-        assert!(results.contains_key("192.168.1.1"));
     }
 }

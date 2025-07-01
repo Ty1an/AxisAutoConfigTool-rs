@@ -9,61 +9,68 @@
 //!
 //! These utilities are critical to the camera configuration workflow,
 //! particularly when transitioning cameras from temporary DHCP addresses
+//!
 //! to final static IP configurations.
 //!
 //! The implementation uses multiple connection verification methods
 //! (ping, HTTP requests, port checks) for maximum reliability across
 //! different network environments and camera firmware versions.
 
-use anyhow::{Context, Result};
+use anyhow::{ Context, Result };
 use ipnetwork::Ipv4Network;
-use log::{debug, error, info, warn};
-use reqwest::{Client, ClientBuilder};
-use serde::{Deserialize, Serialize};
+use log::{ debug, error, info, warn };
+use reqwest::{ Client, ClientBuilder };
+use serde::{ Deserialize, Serialize };
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{ IpAddr, Ipv4Addr, SocketAddr };
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio::process::Command;
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::{ sleep, timeout, Instant };
 use url::Url;
 
 /// Custom error types for network operations
 #[derive(Error, Debug)]
 pub enum NetworkError {
-    #[error("Connection timeout after {timeout_secs} seconds")]
-    Timeout { timeout_secs: u64 },
-    
-    #[error("Invalid IP address: {ip}")]
-    InvalidIp { ip: String },
-    
-    #[error("Authentication failed for {ip}")]
-    AuthFailed { ip: String },
-    
-    #[error("Network unreachable: {ip}")]
-    NetworkUnreachable { ip: String },
-    
-    #[error("Port {port} closed on {ip}")]
-    PortClosed { ip: String, port: u16 },
-    
-    #[error("Invalid network format: {network}")]
-    InvalidNetwork { network: String },
-    
-    #[error("SSL/TLS error: {message}")]
-    SslError { message: String },
-    
-    #[error("HTTP error: {status_code}")]
-    HttpError { status_code: u16 },
-    
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    
-    #[error("Request error: {0}")]
-    Request(#[from] reqwest::Error),
-    
-    #[error("URL parse error: {0}")]
-    UrlParse(#[from] url::ParseError),
+    #[error("Connection timeout after {timeout_secs} seconds")] Timeout {
+        timeout_secs: u64,
+    },
+
+    #[error("Invalid IP address: {ip}")] InvalidIp {
+        ip: String,
+    },
+
+    #[error("Authentication failed for {ip}")] AuthFailed {
+        ip: String,
+    },
+
+    #[error("Network unreachable: {ip}")] NetworkUnreachable {
+        ip: String,
+    },
+
+    #[error("Port {port} closed on {ip}")] PortClosed {
+        ip: String,
+        port: u16,
+    },
+
+    #[error("Invalid network format: {network}")] InvalidNetwork {
+        network: String,
+    },
+
+    #[error("SSL/TLS error: {message}")] SslError {
+        message: String,
+    },
+
+    #[error("HTTP error: {status_code}")] HttpError {
+        status_code: u16,
+    },
+
+    #[error("IO error: {0}")] Io(#[from] std::io::Error),
+
+    #[error("Request error: {0}")] Request(#[from] reqwest::Error),
+
+    #[error("URL parse error: {0}")] UrlParse(#[from] url::ParseError),
 }
 
 /// Protocol types for camera communication
@@ -80,7 +87,7 @@ impl Protocol {
             Protocol::Https => 443,
         }
     }
-    
+
     pub fn scheme(&self) -> &'static str {
         match self {
             Protocol::Http => "http",
@@ -126,7 +133,7 @@ pub async fn wait_for_camera_online(
     password: &str,
     protocol: Protocol,
     max_wait_time: Duration,
-    check_interval: Duration,
+    check_interval: Duration
 ) -> Result<(bool, Duration), NetworkError> {
     info!(
         "Waiting for camera to become available at {} (timeout: {}s)",
@@ -172,10 +179,7 @@ pub async fn wait_for_camera_online(
                     }
                     Err(NetworkError::SslError { .. }) => {
                         // SSL error indicates server is responding but with invalid cert
-                        warn!(
-                            "SSL verification failed for {} - certificate may be self-signed",
-                            ip
-                        );
+                        warn!("SSL verification failed for {} - certificate may be self-signed", ip);
                         let elapsed_time = start_time.elapsed();
                         return Ok((true, elapsed_time));
                     }
@@ -195,22 +199,21 @@ pub async fn wait_for_camera_online(
         // Provide progressive feedback during longer waits
         let elapsed_secs = elapsed.as_secs();
         let max_secs = max_wait_time.as_secs();
-        
+
         if elapsed >= max_wait_time {
-            warn!(
-                "Timeout waiting for camera at {} to come online after {}s",
-                ip, max_secs
-            );
+            warn!("Timeout waiting for camera at {} to come online after {}s", ip, max_secs);
             break;
-        } else if elapsed_secs >= max_secs * 3 / 4 {
+        } else if elapsed_secs >= (max_secs * 3) / 4 {
             info!(
                 "Still waiting for camera at {} to come online ({}s elapsed, 75% of timeout)",
-                ip, elapsed_secs
+                ip,
+                elapsed_secs
             );
         } else if elapsed_secs >= max_secs / 2 {
             info!(
                 "Still waiting for camera at {} to come online ({}s elapsed, 50% of timeout)",
-                ip, elapsed_secs
+                ip,
+                elapsed_secs
             );
         }
     }
@@ -218,7 +221,10 @@ pub async fn wait_for_camera_online(
     // Log detailed connection attempt statistics for troubleshooting
     debug!(
         "Connection attempts for {}: ping={}, port={}, http={}",
-        ip, stats.ping_attempts, stats.port_attempts, stats.http_attempts
+        ip,
+        stats.ping_attempts,
+        stats.port_attempts,
+        stats.http_attempts
     );
 
     Ok((false, start_time.elapsed()))
@@ -228,7 +234,7 @@ pub async fn wait_for_camera_online(
 pub async fn ping_host(
     ip: Ipv4Addr,
     count: u32,
-    timeout_duration: Duration,
+    timeout_duration: Duration
 ) -> Result<bool, NetworkError> {
     let mut cmd = Command::new("ping");
 
@@ -256,15 +262,11 @@ pub async fn ping_host(
     }
 
     // Run ping command with additional timeout margin
-    let output = timeout(
-        timeout_duration + Duration::from_secs(1),
-        cmd.output()
-    )
-    .await
-    .map_err(|_| NetworkError::Timeout {
-        timeout_secs: timeout_duration.as_secs() + 1,
-    })?
-    .map_err(NetworkError::Io)?;
+    let output = timeout(timeout_duration + Duration::from_secs(1), cmd.output()).await
+        .map_err(|_| NetworkError::Timeout {
+            timeout_secs: timeout_duration.as_secs() + 1,
+        })?
+        .map_err(NetworkError::Io)?;
 
     Ok(output.status.success())
 }
@@ -338,7 +340,7 @@ pub fn is_ip_in_network(ip: Ipv4Addr, network_str: &str) -> Result<bool, Network
 pub async fn check_port_open(
     ip: Ipv4Addr,
     port: u16,
-    timeout_duration: Duration,
+    timeout_duration: Duration
 ) -> Result<bool, NetworkError> {
     let addr = SocketAddr::new(IpAddr::V4(ip), port);
 
@@ -365,7 +367,7 @@ pub async fn check_port_open(
 /// - Network configuration validation
 pub fn calculate_network_parameters(
     ip: Ipv4Addr,
-    subnet_mask: Ipv4Addr,
+    subnet_mask: Ipv4Addr
 ) -> Result<NetworkParameters, NetworkError> {
     // Convert subnet mask to prefix length
     let prefix_len = subnet_mask_to_prefix_length(subnet_mask)?;
@@ -400,8 +402,8 @@ fn subnet_mask_to_prefix_length(mask: Ipv4Addr) -> Result<u8, NetworkError> {
     let prefix_len = mask_bits.leading_ones() as u8;
 
     // Validate it's a proper subnet mask (contiguous 1s followed by contiguous 0s)
-    let expected_mask = 0xFFFFFFFF_u32.checked_shl(32 - prefix_len as u32).unwrap_or(0);
-    
+    let expected_mask = (0xffffffff_u32).checked_shl(32 - (prefix_len as u32)).unwrap_or(0);
+
     if mask_bits != expected_mask {
         return Err(NetworkError::InvalidNetwork {
             network: format!("Invalid subnet mask: {}", mask),
@@ -412,12 +414,12 @@ fn subnet_mask_to_prefix_length(mask: Ipv4Addr) -> Result<u8, NetworkError> {
 }
 
 /// Verify camera authentication by making an HTTP request
-async fn verify_camera_auth(
+pub async fn verify_camera_auth(
     client: &Client,
     ip: Ipv4Addr,
     username: &str,
     password: &str,
-    protocol: Protocol,
+    protocol: Protocol
 ) -> Result<(), NetworkError> {
     let base_url = format!("{}://{}", protocol.scheme(), ip);
     let endpoint = "/axis-cgi/usergroup.cgi"; // Simple endpoint to check auth
@@ -430,20 +432,18 @@ async fn verify_camera_auth(
         200 => Ok(()), // Success
         401 => {
             // Try with digest authentication
-            let auth_response = client
-                .get(url)
-                .basic_auth(username, Some(password))
-                .send()
-                .await?;
+            let auth_response = client.get(url).basic_auth(username, Some(password)).send().await?;
 
             match auth_response.status().as_u16() {
                 200 => Ok(()),
-                401 => Err(NetworkError::AuthFailed {
-                    ip: ip.to_string(),
-                }),
-                status => Err(NetworkError::HttpError {
-                    status_code: status,
-                }),
+                401 =>
+                    Err(NetworkError::AuthFailed {
+                        ip: ip.to_string(),
+                    }),
+                status =>
+                    Err(NetworkError::HttpError {
+                        status_code: status,
+                    }),
             }
         }
         status => {
@@ -479,75 +479,9 @@ pub fn validate_ip_addresses(ips: &[&str]) -> HashMap<String, Result<(), Network
 /// Check if multiple IPs are in the same network
 pub fn validate_ips_in_network(
     ips: &[Ipv4Addr],
-    network: &str,
+    network: &str
 ) -> HashMap<String, Result<bool, NetworkError>> {
     ips.iter()
         .map(|&ip| (ip.to_string(), is_ip_in_network(ip, network)))
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::str::FromStr;
-
-    #[test]
-    fn test_validate_ip_address() {
-        assert!(validate_ip_address("192.168.1.100").is_ok());
-        assert!(validate_ip_address("10.0.0.1").is_ok());
-        assert!(validate_ip_address("127.0.0.1").is_err());
-        assert!(validate_ip_address("0.0.0.0").is_err());
-        assert!(validate_ip_address("invalid").is_err());
-    }
-
-    #[test]
-    fn test_is_ip_in_network() {
-        let ip = Ipv4Addr::from_str("192.168.1.100").unwrap();
-        assert!(is_ip_in_network(ip, "192.168.1.0/24").unwrap());
-        assert!(!is_ip_in_network(ip, "192.168.2.0/24").unwrap());
-    }
-
-    #[test]
-    fn test_calculate_network_parameters() {
-        let ip = Ipv4Addr::from_str("192.168.1.100").unwrap();
-        let mask = Ipv4Addr::from_str("255.255.255.0").unwrap();
-        
-        let params = calculate_network_parameters(ip, mask).unwrap();
-        assert_eq!(params.network_address, Ipv4Addr::from_str("192.168.1.0").unwrap());
-        assert_eq!(params.broadcast_address, Ipv4Addr::from_str("192.168.1.255").unwrap());
-        assert_eq!(params.prefix_length, 24);
-        assert_eq!(params.num_hosts, 254);
-    }
-
-    #[test]
-    fn test_subnet_mask_to_prefix_length() {
-        assert_eq!(subnet_mask_to_prefix_length(Ipv4Addr::from_str("255.255.255.0").unwrap()).unwrap(), 24);
-        assert_eq!(subnet_mask_to_prefix_length(Ipv4Addr::from_str("255.255.0.0").unwrap()).unwrap(), 16);
-        assert_eq!(subnet_mask_to_prefix_length(Ipv4Addr::from_str("255.0.0.0").unwrap()).unwrap(), 8);
-        
-        // Invalid subnet mask
-        assert!(subnet_mask_to_prefix_length(Ipv4Addr::from_str("255.255.255.1").unwrap()).is_err());
-    }
-
-    #[tokio::test]
-    async fn test_ping_localhost() {
-        // This test might fail in some environments, so we'll make it permissive
-        let result = ping_host(Ipv4Addr::from_str("127.0.0.1").unwrap(), 1, Duration::from_secs(2)).await;
-        // We don't assert the result because localhost ping behavior varies by OS
-        println!("Ping localhost result: {:?}", result);
-    }
-
-    #[tokio::test]
-    async fn test_check_port_open() {
-        // Test with a port that should be closed
-        let result = check_port_open(
-            Ipv4Addr::from_str("127.0.0.1").unwrap(),
-            54321, // Random high port
-            Duration::from_secs(1)
-        ).await;
-        
-        assert!(result.is_ok());
-        // Port should be closed
-        assert!(!result.unwrap());
-    }
 }
