@@ -4,16 +4,18 @@ version = 4
 
 [[package]]
 name = "AxisAutoConfig"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "base64",
  "byteorder",
+ "calamine",
  "chrono",
  "csv",
  "diqwest",
  "eframe",
- "egui",
+ "egui 0.31.1",
+ "egui-aesthetix",
  "egui_alignments",
  "env_logger",
  "futures",
@@ -28,6 +30,7 @@ dependencies = [
  "rand 0.9.1",
  "reqwest",
  "rfd",
+ "rust_xlsxwriter",
  "serde",
  "serde_json",
  "socket2",
@@ -281,6 +284,15 @@ name = "anyhow"
 version = "1.0.98"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e16d2d3311acee920a9eb8d33b8cbc1787ce4a264e85f964c2404b969bdcd487"
+
+[[package]]
+name = "arbitrary"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dde20b3d026af13f561bdd0f15edf01fc734f0dafcedbaf42bba506a9517f223"
+dependencies = [
+ "derive_arbitrary",
+]
 
 [[package]]
 name = "arboard"
@@ -708,6 +720,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
 
 [[package]]
+name = "calamine"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a3a315226fdc5b1c3e33521073e1712a05944bc0664d665ff1f6ff0396334da"
+dependencies = [
+ "byteorder",
+ "codepage",
+ "encoding_rs",
+ "log",
+ "quick-xml 0.31.0",
+ "serde",
+ "zip 0.6.6",
+]
+
+[[package]]
 name = "calloop"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -793,6 +820,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "15efe7a882b08f34e38556b14f2fb3daa98769d06c7f0c1b076dfd0d983bc892"
 dependencies = [
  "error-code",
+]
+
+[[package]]
+name = "codepage"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48f68d061bc2828ae826206326e61251aca94c1e4a5305cf52d9138639c918b4"
+dependencies = [
+ "encoding_rs",
 ]
 
 [[package]]
@@ -942,6 +978,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
+name = "derive_arbitrary"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30542c1ad912e0e3d22a1935c290e12e8a29d704a420177a31faad4a601a0800"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1046,12 +1093,21 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
 name = "ecolor"
+version = "0.28.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e6b451ff1143f6de0f33fc7f1b68fecfd2c7de06e104de96c4514de3f5396f8"
+dependencies = [
+ "emath 0.28.1",
+]
+
+[[package]]
+name = "ecolor"
 version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc4feb366740ded31a004a0e4452fbf84e80ef432ecf8314c485210229672fd1"
 dependencies = [
  "bytemuck",
- "emath",
+ "emath 0.31.1",
 ]
 
 [[package]]
@@ -1063,7 +1119,7 @@ dependencies = [
  "ahash",
  "bytemuck",
  "document-features",
- "egui",
+ "egui 0.31.1",
  "egui-wgpu",
  "egui-winit",
  "egui_glow",
@@ -1092,6 +1148,18 @@ dependencies = [
 
 [[package]]
 name = "egui"
+version = "0.28.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20c97e70a2768de630f161bb5392cbd3874fcf72868f14df0e002e82e06cb798"
+dependencies = [
+ "ahash",
+ "emath 0.28.1",
+ "epaint 0.28.1",
+ "nohash-hasher",
+]
+
+[[package]]
+name = "egui"
 version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25dd34cec49ab55d85ebf70139cb1ccd29c977ef6b6ba4fe85489d6877ee9ef3"
@@ -1099,11 +1167,20 @@ dependencies = [
  "accesskit",
  "ahash",
  "bitflags 2.9.1",
- "emath",
- "epaint",
+ "emath 0.31.1",
+ "epaint 0.31.1",
  "log",
  "nohash-hasher",
  "profiling",
+]
+
+[[package]]
+name = "egui-aesthetix"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0b91e1b07193fa9bc71849e39a76d30ffd6a2f57bfc54552e3a2df263da577b"
+dependencies = [
+ "egui 0.28.1",
 ]
 
 [[package]]
@@ -1115,8 +1192,8 @@ dependencies = [
  "ahash",
  "bytemuck",
  "document-features",
- "egui",
- "epaint",
+ "egui 0.31.1",
+ "epaint 0.31.1",
  "log",
  "profiling",
  "thiserror 1.0.69",
@@ -1136,7 +1213,7 @@ dependencies = [
  "ahash",
  "arboard",
  "bytemuck",
- "egui",
+ "egui 0.31.1",
  "log",
  "profiling",
  "raw-window-handle",
@@ -1152,7 +1229,7 @@ version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf881b608a1a6050fa4f283834592bd814667de900acb4612a03b0da22f529b5"
 dependencies = [
- "egui",
+ "egui 0.31.1",
 ]
 
 [[package]]
@@ -1163,7 +1240,7 @@ checksum = "910906e3f042ea6d2378ec12a6fd07698e14ddae68aed2d819ffe944a73aab9e"
 dependencies = [
  "ahash",
  "bytemuck",
- "egui",
+ "egui 0.31.1",
  "glow",
  "log",
  "memoffset",
@@ -1172,6 +1249,12 @@ dependencies = [
  "web-sys",
  "winit",
 ]
+
+[[package]]
+name = "emath"
+version = "0.28.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a6a21708405ea88f63d8309650b4d77431f4bc28fb9d8e6f77d3963b51249e6"
 
 [[package]]
 name = "emath"
@@ -1243,6 +1326,20 @@ dependencies = [
 
 [[package]]
 name = "epaint"
+version = "0.28.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f0dcc0a0771e7500e94cd1cb797bd13c9f23b9409bdc3c824e2cbc562b7fa01"
+dependencies = [
+ "ab_glyph",
+ "ahash",
+ "ecolor 0.28.1",
+ "emath 0.28.1",
+ "nohash-hasher",
+ "parking_lot",
+]
+
+[[package]]
+name = "epaint"
 version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41fcc0f5a7c613afd2dee5e4b30c3e6acafb8ad6f0edb06068811f708a67c562"
@@ -1250,8 +1347,8 @@ dependencies = [
  "ab_glyph",
  "ahash",
  "bytemuck",
- "ecolor",
- "emath",
+ "ecolor 0.31.1",
+ "emath 0.31.1",
  "epaint_default_fonts",
  "log",
  "nohash-hasher",
@@ -3208,6 +3305,16 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1004a344b30a54e2ee58d66a71b32d2db2feb0a31f9a2d302bf0536f15de2a33"
+dependencies = [
+ "encoding_rs",
+ "memchr",
+]
+
+[[package]]
+name = "quick-xml"
 version = "0.37.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
@@ -3485,6 +3592,15 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rust_xlsxwriter"
+version = "0.78.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21f14f6d77c0b3a1004a4bb84be3993c65c58145e58600d2c6a2955295b7d9c9"
+dependencies = [
+ "zip 2.4.2",
 ]
 
 [[package]]
@@ -5556,6 +5672,47 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "zip"
+version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "760394e246e4c28189f19d488c058bf16f564016aefac5d32bb1f3b51d5e9261"
+dependencies = [
+ "byteorder",
+ "crc32fast",
+ "crossbeam-utils",
+ "flate2",
+]
+
+[[package]]
+name = "zip"
+version = "2.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
+dependencies = [
+ "arbitrary",
+ "crc32fast",
+ "crossbeam-utils",
+ "displaydoc",
+ "flate2",
+ "indexmap",
+ "memchr",
+ "thiserror 2.0.12",
+ "zopfli",
+]
+
+[[package]]
+name = "zopfli"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edfc5ee405f504cd4984ecc6f14d02d55cfda60fa4b689434ef4102aae150cd7"
+dependencies = [
+ "bumpalo",
+ "crc32fast",
+ "log",
+ "simd-adler32",
 ]
 
 [[package]]

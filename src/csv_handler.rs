@@ -1,19 +1,13 @@
-//! Axis Camera Unified Setup & Configuration Tool
-//! CSV Handler module for reading IP lists and generating reports
-//!
-//! This module provides functionality for:
-//! 1. Validating and reading IP assignment lists from CSV files
-//! 2. Generating inventory reports of configured cameras
-//! 3. Creating sample CSV templates for users
 
-use anyhow::{ Context, Result };
+use anyhow::Result;
+use calamine::{ open_workbook, Reader, Xlsx, Data };
 use chrono::{ DateTime, Utc };
-use csv::{ Reader, ReaderBuilder, Writer, WriterBuilder };
+use csv::{ ReaderBuilder, WriterBuilder };
 use log::{ error, info, warn };
+use rust_xlsxwriter::{ Workbook, Format };
 use serde::{ Deserialize, Serialize };
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs::File;
-use std::net::Ipv4Addr;
 use std::path::Path;
 use thiserror::Error;
 
@@ -57,43 +51,43 @@ pub enum CsvError {
     #[error("IO error: {0}")] Io(#[from] std::io::Error),
 
     #[error("Serialization error: {0}")] Serialization(#[from] serde_json::Error),
+
+    #[error("Excel error: {0}")] Excel(#[from] calamine::Error),
+
+    #[error("Excel writer error: {0}")] ExcelWriter(#[from] rust_xlsxwriter::XlsxError),
 }
 
-/// IP configuration for CSV input
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IpAssignment {
-    pub ip: String,
-    pub mac: Option<String>,
-}
 
 /// Camera data structure for inventory reports
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CameraInventoryData {
-    /// Final IP address assigned to camera
-    pub final_ip: String,
-    /// Temporary IP address used during setup
-    pub temp_ip: Option<String>,
-    /// MAC address of the camera
-    pub mac: Option<String>,
-    /// Verified MAC address (if different from discovered)
-    pub verified_mac: Option<String>,
-    /// Serial number of the camera
-    pub serial: Option<String>,
-    /// Camera name/hostname
-    pub camera_name: Option<String>,
+    /// Item Name
+    pub item_name: Option<String>,
     /// Current firmware version
     pub firmware_version: Option<String>,
-    /// Admin username
-    pub admin_username: Option<String>,
-    /// ONVIF username
-    pub onvif_username: Option<String>,
-    /// Overall status of camera configuration
+    /// MAC address of the camera
+    pub mac_address: Option<String>,
+    /// Serial number of the camera
+    pub serial: Option<String>,
+    /// Final IP address assigned to camera
+    pub ip_address: String,
+    /// Subnet mask
+    pub subnet: String,
+    /// Gateway address
+    pub gateway: String,
+    /// User Name
+    pub user_name: String,
+    /// Password
+    pub password: String,
+    /// Device Map #
+    pub device_map: Option<String>,
+    /// Timestamp when configuration was completed (internal use)
+    pub completion_time: DateTime<Utc>,
+    /// Overall status of camera configuration (internal use)
     pub status: String,
-    /// Individual operation results
+    /// Individual operation results (internal use)
     pub operations: OperationResults,
-    /// Timestamp when this record was created
-    pub report_generated: DateTime<Utc>,
-    /// Tool version that generated this record
+    /// Tool version that generated this record (internal use)
     pub tool_version: String,
 }
 
@@ -147,34 +141,26 @@ impl CsvHandler {
         Self {}
     }
 
-    /// Read IP assignment list from CSV file with enhanced validation
+    /// Import existing CSV file with camera inventory data
     ///
-    /// The CSV can be in one of two formats:
-    /// 1. Sequential assignment: A single column of IP addresses
-    ///    Example:
-    ///    ```csv
-    ///    IP
-    ///    192.168.1.101
-    ///    192.168.1.102
-    ///    ```
+    /// The CSV should have the following columns:
+    /// - Item Name
+    /// - Firmware Version
+    /// - MAC Address
+    /// - Serial #
+    /// - IP Address
+    /// - Subnet
+    /// - Gateway
+    /// - User Name
+    /// - Password
+    /// - Device Map #
     ///
-    /// 2. MAC-specific assignment: Two columns with IP and MAC
-    ///    Example:
-    ///    ```csv
-    ///    IP,MAC
-    ///    192.168.1.101,00408C123456
-    ///    192.168.1.102,00408CAABBCC
-    ///    ```
-    ///
-    /// The function performs extensive validation:
-    /// - Checks for duplicate IP addresses
-    /// - Validates IP address format
-    /// - In MAC-specific mode, validates MAC format and checks for duplicates
-    /// - Verifies column headers match expected format
-    pub fn read_ip_list<P: AsRef<Path>>(
+    /// This function can import an existing CSV and allow editing/updating
+    /// of configuration results.
+    pub fn import_camera_inventory<P: AsRef<Path>>(
         &self,
         file_path: P
-    ) -> Result<Vec<IpAssignment>, CsvError> {
+    ) -> Result<Vec<CameraInventoryData>, CsvError> {
         let path_str = file_path.as_ref().to_string_lossy().to_string();
 
         if !file_path.as_ref().exists() {
@@ -185,40 +171,9 @@ impl CsvHandler {
         let mut reader = ReaderBuilder::new().has_headers(true).flexible(true).from_reader(file);
 
         let headers = reader.headers()?.clone();
-        let header_strings: Vec<String> = headers
-            .iter()
-            .map(|h| h.to_lowercase().trim().to_string())
-            .collect();
+        let header_index = Self::build_header_index(&headers);
 
-        info!("CSV headers found: {:?}", header_strings);
-
-        // Determine if this is MAC-specific format
-        let has_mac =
-            header_strings.contains(&"mac".to_string()) ||
-            header_strings.contains(&"macaddress".to_string());
-
-        // Validate required headers
-        let has_ip =
-            header_strings.contains(&"ip".to_string()) ||
-            header_strings.contains(&"finalipaddress".to_string());
-
-        if !has_ip {
-            return Err(CsvError::ValidationError {
-                message: "CSV file must contain an 'IP' column".to_string(),
-            });
-        }
-
-        if
-            has_mac &&
-            !(
-                header_strings.contains(&"mac".to_string()) ||
-                header_strings.contains(&"macaddress".to_string())
-            )
-        {
-            return Err(CsvError::ValidationError {
-                message: "CSV file appears to be MAC-specific but is missing a 'MAC' column".to_string(),
-            });
-        }
+        info!("CSV headers found: {:?}", headers);
 
         let mut results = Vec::new();
         let mut row_number = 2; // Start at 2 to account for header row
@@ -233,125 +188,95 @@ impl CsvHandler {
                 }
             };
 
-            // Extract IP address
-            let ip = self.extract_field(&record, &headers, &["ip", "finalipaddress"]);
-            let ip = match ip {
+            // Extract all fields
+            let item_name = self.extract_field_with_index(&record, &header_index, &["item name", "camera model name", "model_name", "model"]);
+            let firmware_version = self.extract_field_with_index(&record, &header_index, &["firmware version", "firmware"]);
+            let mac_address = self.extract_field_with_index(&record, &header_index, &["mac address", "mac"]);
+            let serial = self.extract_field_with_index(&record, &header_index, &["serial #", "s/n", "serial", "serial number"]);
+            let ip_address = self.extract_field_with_index(&record, &header_index, &["ip address", "ip"]);
+            let subnet = self.extract_field_with_index(&record, &header_index, &["subnet", "subnet mask"]);
+            let gateway = self.extract_field_with_index(&record, &header_index, &["gateway", "gateway address"]);
+            let user_name = self.extract_field_with_index(&record, &header_index, &["user name", "admin user name(root)", "admin username", "username"]);
+            let password = self.extract_field_with_index(&record, &header_index, &["password", "admin(root) password", "admin password"]);
+            let device_map = self.extract_field_with_index(&record, &header_index, &["device map #", "device map"]);
+            let completion_time_str = self.extract_field_with_index(&record, &header_index, &["current time/date it was finish configuring", "completion time", "timestamp"]);
+
+            // Skip rows without required fields
+            let ip_address = match ip_address {
                 Some(ip_str) if !ip_str.trim().is_empty() => ip_str.trim().to_string(),
                 _ => {
-                    warn!("Skipping row {}: Missing IP address", row_number);
+                    warn!("Skipping row {}: Missing or empty IP address. Check columns: {}", 
+                          row_number, 
+                          headers.iter().collect::<Vec<_>>().join(", "));
                     row_number += 1;
                     continue;
                 }
             };
 
-            // Validate IP address format
-            if let Err(e) = ip.parse::<Ipv4Addr>() {
-                warn!("Skipping row {}: Invalid IP address '{}': {}", row_number, ip, e);
-                row_number += 1;
-                continue;
-            }
-
-            // Extract MAC address if this is MAC-specific format
-            let mac = if has_mac {
-                let mac = self.extract_field(&record, &headers, &["mac", "macaddress"]);
-                match mac {
-                    Some(mac_str) if !mac_str.trim().is_empty() => {
-                        let cleaned_mac = mac_str.trim().to_uppercase();
-                        if !self.validate_mac_format(&cleaned_mac) {
-                            warn!(
-                                "Skipping row {}: Invalid MAC address format '{}'",
-                                row_number,
-                                cleaned_mac
-                            );
-                            row_number += 1;
-                            continue;
-                        }
-                        Some(self.normalize_mac(&cleaned_mac))
-                    }
-                    _ => {
-                        warn!("Skipping row {}: Missing MAC address", row_number);
-                        row_number += 1;
-                        continue;
-                    }
-                }
+            // Parse completion time or use current time
+            let completion_time = if let Some(time_str) = completion_time_str {
+                DateTime::parse_from_rfc3339(&time_str)
+                    .or_else(|_| DateTime::parse_from_str(&time_str, "%Y-%m-%d %H:%M:%S %z"))
+                    .or_else(|_| DateTime::parse_from_str(&time_str, "%Y-%m-%d %H:%M:%S"))
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now())
             } else {
-                None
+                Utc::now()
             };
 
-            results.push(IpAssignment { ip, mac });
+            let camera_data = CameraInventoryData {
+                item_name,
+                firmware_version,
+                mac_address,
+                serial,
+                ip_address,
+                subnet: subnet.unwrap_or_else(|| "255.255.255.0".to_string()),
+                gateway: gateway.unwrap_or_else(|| "192.168.1.1".to_string()),
+                user_name: user_name.unwrap_or_else(|| "root".to_string()),
+                password: password.unwrap_or_default(),
+                device_map,
+                completion_time,
+                status: "imported".to_string(),
+                operations: OperationResults::default(),
+                tool_version: "1.0".to_string(),
+            };
+
+            results.push(camera_data);
             row_number += 1;
         }
 
         if results.is_empty() {
             return Err(CsvError::ValidationError {
-                message: "No valid IP assignments found in the CSV file".to_string(),
+                message: format!(
+                    "No valid camera inventory data found in the CSV file. Please ensure your file contains:\n\
+                    • A header row with column names\n\
+                    • At least one data row with an IP address\n\
+                    • Supported column names: 'IP Address', 'IP', 'Item Name', 'MAC Address', 'Serial #', etc.\n\
+                    • Found {} total rows (excluding header)", 
+                    row_number - 2
+                ),
             });
         }
 
-        // Perform comprehensive validation
-        self.validate_assignments(&results)?;
-
-        info!("Successfully validated and read {} IP assignments from {}", results.len(), path_str);
+        info!("Successfully imported {} camera inventory records from {}", results.len(), path_str);
 
         Ok(results)
     }
 
-    /// Read sequential IP assignment list from CSV file
-    pub fn read_sequential_ip_list<P: AsRef<Path>>(
-        &self,
-        file_path: P
-    ) -> Result<Vec<String>, CsvError> {
-        let assignments = self.read_ip_list(file_path)?;
-
-        if let Some(first) = assignments.first() {
-            if first.mac.is_some() {
-                warn!(
-                    "CSV appears to be in MAC-specific format, but sequential was requested. Using IP addresses only."
-                );
-            }
-        }
-
-        Ok(
-            assignments
-                .into_iter()
-                .map(|a| a.ip)
-                .collect()
-        )
-    }
-
-    /// Read MAC-specific IP assignment list from CSV file
-    pub fn read_mac_specific_ip_list<P: AsRef<Path>>(
-        &self,
-        file_path: P
-    ) -> Result<std::collections::HashMap<String, String>, CsvError> {
-        let assignments = self.read_ip_list(file_path)?;
-
-        // Verify this is actually MAC-specific format
-        if assignments.iter().any(|a| a.mac.is_none()) {
-            return Err(CsvError::ValidationError {
-                message: "CSV file is not in MAC-specific format (missing MAC address column)".to_string(),
-            });
-        }
-
-        let mut mac_to_ip = std::collections::HashMap::new();
-        for assignment in assignments {
-            if let Some(mac) = assignment.mac {
-                mac_to_ip.insert(mac, assignment.ip);
-            }
-        }
-
-        Ok(mac_to_ip)
-    }
 
     /// Write comprehensive inventory report to CSV file
     ///
-    /// Creates a detailed report containing:
-    /// - Camera identification (IPs, MACs, serials, names)
-    /// - Configuration status for each operation performed
-    /// - Firmware version information
-    /// - Login credentials used
-    /// - Timestamp information for tracking purposes
-    /// - Tool version information for record-keeping
+    /// Creates a detailed report with the required columns:
+    /// - Item Name
+    /// - Firmware Version
+    /// - MAC Address
+    /// - Serial #
+    /// - IP Address
+    /// - Subnet
+    /// - Gateway
+    /// - User Name
+    /// - Password
+    /// - Device Map #
     pub fn write_inventory_report<P: AsRef<Path>>(
         &self,
         file_path: P,
@@ -366,131 +291,40 @@ impl CsvHandler {
         let file = File::create(&file_path)?;
         let mut writer = WriterBuilder::new().has_headers(true).from_writer(file);
 
-        // Write header
-        writer.write_record(
-            &[
-                "final_ip",
-                "temp_ip",
-                "mac",
-                "verified_mac",
-                "serial",
-                "camera_name",
-                "firmware_version",
-                "admin_username",
-                "onvif_username",
-                "status",
-                "create_admin_success",
-                "create_admin_message",
-                "create_admin_timestamp",
-                "create_onvif_user_success",
-                "create_onvif_user_message",
-                "create_onvif_user_timestamp",
-                "set_static_ip_success",
-                "set_static_ip_message",
-                "set_static_ip_timestamp",
-                "upgrade_firmware_success",
-                "upgrade_firmware_message",
-                "upgrade_firmware_timestamp",
-                "report_generated",
-                "tool_version",
-            ]
-        )?;
+        // Write header with the exact labels requested
+        writer.write_record([
+            "Item Name",
+            "Firmware Version",
+            "MAC Address",
+            "Serial #",
+            "IP Address",
+            "Subnet",
+            "Gateway",
+            "User Name",
+            "Password",
+            "Device Map #",
+        ])?;
 
         // Write data rows
         for camera in camera_data {
-            let ops = &camera.operations;
-
-            // Create string values for all fields to avoid reference issues
-            let temp_ip_str = camera.temp_ip.as_deref().unwrap_or("").to_string();
-            let mac_str = camera.mac.as_deref().unwrap_or("").to_string();
-            let verified_mac_str = camera.verified_mac.as_deref().unwrap_or("").to_string();
-            let serial_str = camera.serial.as_deref().unwrap_or("").to_string();
-            let camera_name_str = camera.camera_name.as_deref().unwrap_or("").to_string();
+            let item_name_str = camera.item_name.as_deref().unwrap_or("").to_string();
             let firmware_version_str = camera.firmware_version.as_deref().unwrap_or("").to_string();
-            let admin_username_str = camera.admin_username.as_deref().unwrap_or("").to_string();
-            let onvif_username_str = camera.onvif_username.as_deref().unwrap_or("").to_string();
+            let mac_address_str = camera.mac_address.as_deref().unwrap_or("").to_string();
+            let serial_str = camera.serial.as_deref().unwrap_or("").to_string();
+            let device_map_str = camera.device_map.as_deref().unwrap_or("").to_string();
 
-            // Create operation result strings
-            let create_admin_success = ops.create_admin
-                .as_ref()
-                .map(|op| op.success.to_string())
-                .unwrap_or_default();
-            let create_admin_message = ops.create_admin
-                .as_ref()
-                .map(|op| op.message.clone())
-                .unwrap_or_default();
-            let create_admin_timestamp = ops.create_admin
-                .as_ref()
-                .map(|op| op.timestamp.to_rfc3339())
-                .unwrap_or_default();
-
-            let create_onvif_user_success = ops.create_onvif_user
-                .as_ref()
-                .map(|op| op.success.to_string())
-                .unwrap_or_default();
-            let create_onvif_user_message = ops.create_onvif_user
-                .as_ref()
-                .map(|op| op.message.clone())
-                .unwrap_or_default();
-            let create_onvif_user_timestamp = ops.create_onvif_user
-                .as_ref()
-                .map(|op| op.timestamp.to_rfc3339())
-                .unwrap_or_default();
-
-            let set_static_ip_success = ops.set_static_ip
-                .as_ref()
-                .map(|op| op.success.to_string())
-                .unwrap_or_default();
-            let set_static_ip_message = ops.set_static_ip
-                .as_ref()
-                .map(|op| op.message.clone())
-                .unwrap_or_default();
-            let set_static_ip_timestamp = ops.set_static_ip
-                .as_ref()
-                .map(|op| op.timestamp.to_rfc3339())
-                .unwrap_or_default();
-
-            let upgrade_firmware_success = ops.upgrade_firmware
-                .as_ref()
-                .map(|op| op.success.to_string())
-                .unwrap_or_default();
-            let upgrade_firmware_message = ops.upgrade_firmware
-                .as_ref()
-                .map(|op| op.message.clone())
-                .unwrap_or_default();
-            let upgrade_firmware_timestamp = ops.upgrade_firmware
-                .as_ref()
-                .map(|op| op.timestamp.to_rfc3339())
-                .unwrap_or_default();
-
-            writer.write_record(
-                &[
-                    &camera.final_ip,
-                    &temp_ip_str,
-                    &mac_str,
-                    &verified_mac_str,
-                    &serial_str,
-                    &camera_name_str,
-                    &firmware_version_str,
-                    &admin_username_str,
-                    &onvif_username_str,
-                    &camera.status,
-                    &create_admin_success,
-                    &create_admin_message,
-                    &create_admin_timestamp,
-                    &create_onvif_user_success,
-                    &create_onvif_user_message,
-                    &create_onvif_user_timestamp,
-                    &set_static_ip_success,
-                    &set_static_ip_message,
-                    &set_static_ip_timestamp,
-                    &upgrade_firmware_success,
-                    &upgrade_firmware_message,
-                    &upgrade_firmware_timestamp,
-                    &camera.report_generated.to_rfc3339(),
-                    &camera.tool_version,
-                ]
-            )?;
+            writer.write_record([
+                &item_name_str,
+                &firmware_version_str,
+                &mac_address_str,
+                &serial_str,
+                &camera.ip_address,
+                &camera.subnet,
+                &camera.gateway,
+                &camera.user_name,
+                &camera.password,
+                &device_map_str,
+            ])?;
         }
 
         writer.flush()?;
@@ -504,22 +338,219 @@ impl CsvHandler {
         Ok(())
     }
 
-    // Private helper methods
-
-    /// Extract field value from CSV record
-    fn extract_field(
+    /// Update an existing CSV file with new camera configuration data
+    ///
+    /// This function can merge new configuration results with existing CSV data,
+    /// updating entries that match by MAC address or IP address.
+    pub fn update_inventory_csv<P: AsRef<Path>>(
         &self,
-        record: &csv::StringRecord,
-        headers: &csv::StringRecord,
+        file_path: P,
+        new_camera_data: &[CameraInventoryData]
+    ) -> Result<(), CsvError> {
+        // First, try to read existing data
+        let mut existing_data = match self.import_camera_inventory(&file_path) {
+            Ok(data) => data,
+            Err(_) => Vec::new(), // File doesn't exist or is empty, start fresh
+        };
+
+        // Update existing entries or add new ones
+        for new_camera in new_camera_data {
+            let mut updated = false;
+            
+            // Try to find existing entry by MAC address first, then by IP
+            for existing_camera in &mut existing_data {
+                if let (Some(existing_mac), Some(new_mac)) = (&existing_camera.mac_address, &new_camera.mac_address) {
+                    if existing_mac == new_mac {
+                        *existing_camera = new_camera.clone();
+                        updated = true;
+                        break;
+                    }
+                } else if existing_camera.ip_address == new_camera.ip_address {
+                    *existing_camera = new_camera.clone();
+                    updated = true;
+                    break;
+                }
+            }
+            
+            // If not found, add as new entry
+            if !updated {
+                existing_data.push(new_camera.clone());
+            }
+        }
+
+        // Write the updated data back to the file
+        self.write_inventory_report(file_path, &existing_data)
+    }
+
+    /// Create a sample CSV template file
+    pub fn create_sample_csv<P: AsRef<Path>>(&self, file_path: P) -> Result<(), CsvError> {
+        let sample_data = vec![
+            CameraInventoryData {
+                item_name: Some("AXIS P1435-LE".to_string()),
+                firmware_version: Some("10.12.182".to_string()),
+                mac_address: Some("00408C123456".to_string()),
+                serial: Some("ACCC8E123456".to_string()),
+                ip_address: "192.168.1.101".to_string(),
+                subnet: "255.255.255.0".to_string(),
+                gateway: "192.168.1.1".to_string(),
+                user_name: "root".to_string(),
+                password: "password123".to_string(),
+                device_map: Some("1".to_string()),
+                completion_time: Utc::now(),
+                status: "configured".to_string(),
+                operations: OperationResults::default(),
+                tool_version: "1.0".to_string(),
+            },
+            CameraInventoryData {
+                item_name: Some("AXIS P3245-LVE".to_string()),
+                firmware_version: Some("10.12.182".to_string()),
+                mac_address: Some("00408CAABBCC".to_string()),
+                serial: Some("ACCC8EAABBCC".to_string()),
+                ip_address: "192.168.1.102".to_string(),
+                subnet: "255.255.255.0".to_string(),
+                gateway: "192.168.1.1".to_string(),
+                user_name: "root".to_string(),
+                password: "password123".to_string(),
+                device_map: Some("2".to_string()),
+                completion_time: Utc::now(),
+                status: "configured".to_string(),
+                operations: OperationResults::default(),
+                tool_version: "1.0".to_string(),
+            },
+        ];
+
+        self.write_inventory_report(file_path, &sample_data)
+    }
+
+    /// Import existing Excel (.xlsx) file with camera inventory data
+    pub fn import_camera_inventory_excel<P: AsRef<Path>>(
+        &self,
+        file_path: P
+    ) -> Result<Vec<CameraInventoryData>, CsvError> {
+        let path_str = file_path.as_ref().to_string_lossy().to_string();
+
+        if !file_path.as_ref().exists() {
+            return Err(CsvError::FileNotFound { path: path_str });
+        }
+
+        let mut workbook: Xlsx<_> = open_workbook(&file_path).map_err(|e| CsvError::Excel(calamine::Error::Xlsx(e)))?;
+        let worksheet_names = workbook.sheet_names();
+        
+        if worksheet_names.is_empty() {
+            return Err(CsvError::ValidationError {
+                message: "Excel file contains no worksheets".to_string(),
+            });
+        }
+
+        // Use the first worksheet
+        let worksheet_name = &worksheet_names[0];
+        let range = workbook.worksheet_range(worksheet_name).map_err(|e| CsvError::Excel(calamine::Error::Xlsx(e)))?;
+
+        let mut results = Vec::new();
+        let mut header_map = HashMap::new();
+
+        // Process the first row to build header mapping
+        if let Some(first_row) = range.rows().next() {
+            for (col_idx, cell) in first_row.iter().enumerate() {
+                if let Data::String(header) = cell {
+                    let normalized_header = header.to_lowercase().trim().to_string();
+                    header_map.insert(normalized_header, col_idx);
+                }
+            }
+        }
+
+        // Process data rows (skip header row)
+        for (row_idx, row) in range.rows().enumerate().skip(1) {
+            let item_name = self.extract_excel_field(row, &header_map, &["item name", "camera model name", "model_name", "model"]);
+            let firmware_version = self.extract_excel_field(row, &header_map, &["firmware version", "firmware"]);
+            let mac_address = self.extract_excel_field(row, &header_map, &["mac address", "mac"]);
+            let serial = self.extract_excel_field(row, &header_map, &["serial #", "s/n", "serial", "serial number"]);
+            let ip_address = self.extract_excel_field(row, &header_map, &["ip address", "ip"]);
+            let subnet = self.extract_excel_field(row, &header_map, &["subnet", "subnet mask"]);
+            let gateway = self.extract_excel_field(row, &header_map, &["gateway", "gateway address"]);
+            let user_name = self.extract_excel_field(row, &header_map, &["user name", "admin user name(root)", "admin username", "username"]);
+            let password = self.extract_excel_field(row, &header_map, &["password", "admin(root) password", "admin password"]);
+            let device_map = self.extract_excel_field(row, &header_map, &["device map #", "device map"]);
+            let completion_time_str = self.extract_excel_field(row, &header_map, &["current time/date it was finish configuring", "completion time", "timestamp"]);
+
+            // Skip rows without required fields
+            let ip_address = match ip_address {
+                Some(ip_str) if !ip_str.trim().is_empty() => ip_str.trim().to_string(),
+                _ => {
+                    let available_headers: Vec<String> = header_map.keys().cloned().collect();
+                    warn!("Skipping row {}: Missing or empty IP address. Available columns: {}", 
+                          row_idx + 1, 
+                          available_headers.join(", "));
+                    continue;
+                }
+            };
+
+            // Parse completion time or use current time
+            let completion_time = if let Some(time_str) = completion_time_str {
+                DateTime::parse_from_rfc3339(&time_str)
+                    .or_else(|_| DateTime::parse_from_str(&time_str, "%Y-%m-%d %H:%M:%S %z"))
+                    .or_else(|_| DateTime::parse_from_str(&time_str, "%Y-%m-%d %H:%M:%S"))
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now())
+            } else {
+                Utc::now()
+            };
+
+            let camera_data = CameraInventoryData {
+                item_name,
+                firmware_version,
+                mac_address,
+                serial,
+                ip_address,
+                subnet: subnet.unwrap_or_else(|| "255.255.255.0".to_string()),
+                gateway: gateway.unwrap_or_else(|| "192.168.1.1".to_string()),
+                user_name: user_name.unwrap_or_else(|| "root".to_string()),
+                password: password.unwrap_or_default(),
+                device_map,
+                completion_time,
+                status: "imported".to_string(),
+                operations: OperationResults::default(),
+                tool_version: "1.0".to_string(),
+            };
+
+            results.push(camera_data);
+        }
+
+        if results.is_empty() {
+            let total_rows = range.rows().count().saturating_sub(1); // Subtract header row
+            return Err(CsvError::ValidationError {
+                message: format!(
+                    "No valid camera inventory data found in the Excel file. Please ensure your file contains:\n\
+                    • A header row with column names in the first row\n\
+                    • At least one data row with an IP address\n\
+                    • Supported column names: 'IP Address', 'IP', 'Item Name', 'MAC Address', 'Serial #', etc.\n\
+                    • Found {} total rows (excluding header)", 
+                    total_rows
+                ),
+            });
+        }
+
+        info!("Successfully imported {} camera inventory records from Excel file", results.len());
+        Ok(results)
+    }
+
+    /// Extract field value from Excel row using header mapping
+    fn extract_excel_field(
+        &self,
+        row: &[Data],
+        header_map: &HashMap<String, usize>,
         field_names: &[&str]
     ) -> Option<String> {
         for field_name in field_names {
-            for (i, header) in headers.iter().enumerate() {
-                if header.to_lowercase().trim() == field_name.to_lowercase() {
-                    if let Some(value) = record.get(i) {
-                        if !value.trim().is_empty() {
-                            return Some(value.to_string());
-                        }
+            let normalized_field = field_name.to_lowercase();
+            if let Some(&col_idx) = header_map.get(&normalized_field) {
+                if let Some(cell) = row.get(col_idx) {
+                    match cell {
+                        Data::String(s) if !s.trim().is_empty() => return Some(s.clone()),
+                        Data::Float(f) => return Some(f.to_string()),
+                        Data::Int(i) => return Some(i.to_string()),
+                        Data::Bool(b) => return Some(b.to_string()),
+                        _ => {}
                     }
                 }
             }
@@ -527,129 +558,164 @@ impl CsvHandler {
         None
     }
 
-    /// Validate all assignments for duplicates and format issues
-    fn validate_assignments(&self, assignments: &[IpAssignment]) -> Result<(), CsvError> {
-        // Check for duplicate IPs
-        let mut seen_ips = HashSet::new();
-        let mut duplicate_ips = Vec::new();
-
-        for assignment in assignments {
-            if !seen_ips.insert(&assignment.ip) {
-                duplicate_ips.push(assignment.ip.clone());
-            }
-        }
-
-        if !duplicate_ips.is_empty() {
-            return Err(CsvError::DuplicateIps {
-                ips: duplicate_ips.join(", "),
+    /// Write comprehensive inventory report to Excel (.xlsx) file
+    pub fn write_inventory_report_excel<P: AsRef<Path>>(
+        &self,
+        file_path: P,
+        camera_data: &[CameraInventoryData]
+    ) -> Result<(), CsvError> {
+        if camera_data.is_empty() {
+            return Err(CsvError::ValidationError {
+                message: "No camera data provided for inventory report".to_string(),
             });
         }
 
-        // Check for duplicate MACs if MAC-specific
-        let macs: Vec<_> = assignments
-            .iter()
-            .filter_map(|a| a.mac.as_ref())
-            .collect();
+        let mut workbook = Workbook::new();
+        let worksheet = workbook.add_worksheet();
 
-        if !macs.is_empty() {
-            let mut seen_macs = HashSet::new();
-            let mut duplicate_macs = Vec::new();
+        // Create header format
+        let header_format = Format::new()
+            .set_bold()
+            .set_background_color(rust_xlsxwriter::Color::RGB(0xD9E2F3));
 
-            for mac in &macs {
-                if !seen_macs.insert(mac) {
-                    duplicate_macs.push((*mac).clone());
+        // Write headers
+        let headers = [
+            "Item Name",
+            "Firmware Version", 
+            "MAC Address",
+            "Serial #",
+            "IP Address",
+            "Subnet",
+            "Gateway",
+            "User Name",
+            "Password",
+            "Device Map #",
+        ];
+
+        for (col, header) in headers.iter().enumerate() {
+            worksheet.write_string_with_format(0, col as u16, *header, &header_format)?;
+        }
+
+        // Write data rows
+        for (row_idx, camera) in camera_data.iter().enumerate() {
+            let row = (row_idx + 1) as u32; // +1 to skip header row
+            
+            let item_name_str = camera.item_name.as_deref().unwrap_or("");
+            let firmware_version_str = camera.firmware_version.as_deref().unwrap_or("");
+            let mac_address_str = camera.mac_address.as_deref().unwrap_or("");
+            let serial_str = camera.serial.as_deref().unwrap_or("");
+            let device_map_str = camera.device_map.as_deref().unwrap_or("");
+
+            worksheet.write_string(row, 0, item_name_str)?;
+            worksheet.write_string(row, 1, firmware_version_str)?;
+            worksheet.write_string(row, 2, mac_address_str)?;
+            worksheet.write_string(row, 3, serial_str)?;
+            worksheet.write_string(row, 4, &camera.ip_address)?;
+            worksheet.write_string(row, 5, &camera.subnet)?;
+            worksheet.write_string(row, 6, &camera.gateway)?;
+            worksheet.write_string(row, 7, &camera.user_name)?;
+            worksheet.write_string(row, 8, &camera.password)?;
+            worksheet.write_string(row, 9, device_map_str)?;
+        }
+
+        // Auto-fit columns  
+        worksheet.autofit();
+
+        workbook.save(&file_path)?;
+
+        info!(
+            "Wrote Excel inventory report for {} cameras to {}",
+            camera_data.len(),
+            file_path.as_ref().to_string_lossy()
+        );
+
+        Ok(())
+    }
+
+    /// Update an existing Excel file with new camera configuration data
+    pub fn update_inventory_excel<P: AsRef<Path>>(
+        &self,
+        file_path: P,
+        new_camera_data: &[CameraInventoryData]
+    ) -> Result<(), CsvError> {
+        // First, try to read existing data
+        let mut existing_data = match self.import_camera_inventory_excel(&file_path) {
+            Ok(data) => data,
+            Err(_) => Vec::new(), // File doesn't exist or is empty, start fresh
+        };
+
+        // Update existing entries or add new ones
+        for new_camera in new_camera_data {
+            let mut updated = false;
+            
+            // Try to find existing entry by MAC address first, then by IP
+            for existing_camera in &mut existing_data {
+                if let (Some(existing_mac), Some(new_mac)) = (&existing_camera.mac_address, &new_camera.mac_address) {
+                    if existing_mac == new_mac {
+                        *existing_camera = new_camera.clone();
+                        updated = true;
+                        break;
+                    }
+                } else if existing_camera.ip_address == new_camera.ip_address {
+                    *existing_camera = new_camera.clone();
+                    updated = true;
+                    break;
                 }
             }
-
-            if !duplicate_macs.is_empty() {
-                return Err(CsvError::DuplicateMacs {
-                    macs: duplicate_macs.join(", "),
-                });
+            
+            // If not found, add as new entry
+            if !updated {
+                existing_data.push(new_camera.clone());
             }
+        }
 
-            // Verify all MACs are properly formatted
-            for (idx, assignment) in assignments.iter().enumerate() {
-                if let Some(mac) = &assignment.mac {
-                    if !self.is_valid_mac(mac) {
-                        return Err(CsvError::InvalidMac {
-                            mac: format!("Row {}: {}", idx + 2, mac),
-                        });
+        // Write the updated data back to the Excel file
+        self.write_inventory_report_excel(file_path, &existing_data)
+    }
+
+    // Private helper methods
+
+    /// Extract field value from CSV record
+    /// Build a header index for O(1) lookups
+    fn build_header_index(headers: &csv::StringRecord) -> HashMap<String, usize> {
+        headers
+            .iter()
+            .enumerate()
+            .map(|(i, header)| (header.to_lowercase().trim().to_string(), i))
+            .collect()
+    }
+
+    fn extract_field_with_index(
+        &self,
+        record: &csv::StringRecord,
+        header_index: &HashMap<String, usize>,
+        field_names: &[&str]
+    ) -> Option<String> {
+        for field_name in field_names {
+            let normalized_field = field_name.to_lowercase();
+            if let Some(&index) = header_index.get(&normalized_field) {
+                if let Some(value) = record.get(index) {
+                    if !value.trim().is_empty() {
+                        return Some(value.to_string());
                     }
                 }
             }
         }
-
-        // Verify IP subnet consistency
-        if assignments.len() > 1 {
-            let ips: Vec<_> = assignments
-                .iter()
-                .map(|a| &a.ip)
-                .collect();
-            if let Err(e) = self.verify_ip_subnet_consistency(&ips) {
-                warn!("IP subnet consistency check failed: {}", e);
-            }
-        }
-
-        Ok(())
+        None
     }
 
-    /// Validate basic MAC address format
-    fn validate_mac_format(&self, mac: &str) -> bool {
-        let clean_mac = mac.replace(':', "").replace('-', "").replace('.', "");
-
-        // Check length and hex characters
-        clean_mac.len() == 12 && clean_mac.chars().all(|c| c.is_ascii_hexdigit())
+    fn extract_field(
+        &self,
+        record: &csv::StringRecord,
+        headers: &csv::StringRecord,
+        field_names: &[&str]
+    ) -> Option<String> {
+        // For backward compatibility, build index each time
+        // In practice, you'd build this once and reuse it
+        let header_index = Self::build_header_index(headers);
+        self.extract_field_with_index(record, &header_index, field_names)
     }
 
-    /// Perform comprehensive MAC address validation
-    fn is_valid_mac(&self, mac: &str) -> bool {
-        let clean_mac = mac.replace(':', "").replace('-', "").replace('.', "");
-
-        // Check length and hex characters
-        if clean_mac.len() != 12 || !clean_mac.chars().all(|c| c.is_ascii_hexdigit()) {
-            return false;
-        }
-
-        // Check for invalid patterns (all zeros, all FFs)
-        if clean_mac == "000000000000" || clean_mac == "FFFFFFFFFFFF" {
-            return false;
-        }
-
-        true
-    }
-
-    /// Normalize MAC address to consistent format (no delimiters, uppercase)
-    fn normalize_mac(&self, mac: &str) -> String {
-        mac.replace(':', "").replace('-', "").replace('.', "").to_uppercase()
-    }
-
-    /// Check if all IP addresses are in the same subnet
-    fn verify_ip_subnet_consistency(&self, ip_addresses: &[&String]) -> Result<(), CsvError> {
-        if ip_addresses.len() < 2 {
-            return Ok(());
-        }
-
-        let first_ip = ip_addresses[0].parse::<Ipv4Addr>().map_err(|e| CsvError::InvalidIp {
-            ip: format!("{}: {}", ip_addresses[0], e),
-        })?;
-
-        let first_network = u32::from(first_ip) & 0xffffff00; // /24 network
-
-        for ip_str in &ip_addresses[1..] {
-            let ip = ip_str.parse::<Ipv4Addr>().map_err(|e| CsvError::InvalidIp {
-                ip: format!("{}: {}", ip_str, e),
-            })?;
-
-            let network = u32::from(ip) & 0xffffff00; // /24 network
-
-            if network != first_network {
-                warn!("IP addresses span multiple subnets - this might cause connectivity issues");
-                break;
-            }
-        }
-
-        Ok(())
-    }
 }
 
 impl Default for CsvHandler {

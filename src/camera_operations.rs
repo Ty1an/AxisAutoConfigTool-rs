@@ -1,22 +1,19 @@
 //! Axis Camera Unified Setup & Configuration Tool
 //! Camera operations module for VAPIX
 
-use anyhow::{ Context, Result };
+use anyhow::Result;
 use log::{ debug, error, info, warn };
 use reqwest::{ multipart, Client, ClientBuilder, Response };
 use serde::{ Deserialize, Serialize };
 use serde_json::{ json, Value };
 use url::Url;
 use std::net::Ipv4Addr;
-use std::path::Path;
 use std::time::Duration;
+use std::sync::Arc;
 use thiserror::Error;
-use tokio::fs::File;
-use tokio::io::AsyncReadExt;
 use diqwest::WithDigestAuth;
-use reqwest::header::{ HeaderValue, AUTHORIZATION, WWW_AUTHENTICATE };
+use reqwest::header::{ AUTHORIZATION, WWW_AUTHENTICATE };
 use std::collections::HashMap;
-use md5;
 
 /// Custom error types for camera operations
 #[derive(Error, Debug)]
@@ -52,6 +49,13 @@ pub enum CameraError {
 
     #[error("Firmware upgrade failed: {message}")] FirmwareUpgradeFailed {
         message: String,
+    },
+
+    #[error(
+        "Model incompatible: Camera model '{camera_model}' not compatible with firmware. Compatible models: {compatible_models}"
+    )] ModelIncompatible {
+        camera_model: String,
+        compatible_models: String,
     },
 
     #[error("Invalid network configuration: {message}")] InvalidNetworkConfig {
@@ -110,6 +114,128 @@ pub struct FirmwareUpgradeOptions {
     pub commit_automatically: bool,
 }
 
+/// Firmware file information with model compatibility
+#[derive(Debug, Clone)]
+pub struct FirmwareFile {
+    pub filename: String,
+    pub file_path: Option<std::path::PathBuf>, // Store file path for lazy loading
+    pub data: Option<Arc<Vec<u8>>>, // Lazy-loaded data
+    pub compatible_models: Vec<String>, // List of compatible camera models
+}
+
+/// Model-to-firmware mapping for multi-model support
+#[derive(Debug, Clone)]
+pub struct ModelFirmwareMapping {
+    pub firmware_files: Vec<FirmwareFile>,
+}
+
+impl ModelFirmwareMapping {
+    pub fn new() -> Self {
+        Self {
+            firmware_files: Vec::new(),
+        }
+    }
+
+    pub fn add_firmware(
+        &mut self,
+        filename: String,
+        data: Arc<Vec<u8>>,
+        compatible_models: Vec<String>
+    ) {
+        self.firmware_files.push(FirmwareFile {
+            filename,
+            file_path: None,
+            data: Some(data),
+            compatible_models,
+        });
+    }
+
+    pub fn add_firmware_path(
+        &mut self,
+        filename: String,
+        file_path: std::path::PathBuf,
+        compatible_models: Vec<String>
+    ) {
+        self.firmware_files.push(FirmwareFile {
+            filename,
+            file_path: Some(file_path),
+            data: None,
+            compatible_models,
+        });
+    }
+
+    // Match firmware files to camera models using both user-defined mappings and filename parsing
+    pub fn find_firmware_for_model(&self, model_name: &str) -> Option<&FirmwareFile> {
+        self.firmware_files.iter().find(|fw| {
+            // First try exact matching with user-defined compatible models
+            let user_model_match = fw.compatible_models
+                .iter()
+                .any(|compatible_model| {
+                    model_name.to_lowercase().contains(&compatible_model.to_lowercase()) ||
+                        compatible_model.to_lowercase().contains(&model_name.to_lowercase())
+                });
+
+            if user_model_match {
+                return true;
+            }
+
+            // If no user-defined models match, try extracting model from firmware filename
+            // Example: "P3219-PLE_11_11_148.bin" -> extract "P3219-PLE"
+            if let Some(extracted_model) = Self::extract_model_from_firmware_filename(&fw.filename) {
+                // Check if camera model contains the extracted firmware model prefix
+                model_name.to_lowercase().contains(&extracted_model.to_lowercase()) ||
+                    extracted_model.to_lowercase().contains(&model_name.to_lowercase())
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Load firmware data on demand (lazy loading)
+    pub fn load_firmware_data(
+        &mut self,
+        firmware_file: &mut FirmwareFile
+    ) -> Result<Arc<Vec<u8>>, std::io::Error> {
+        if let Some(data) = &firmware_file.data {
+            return Ok(data.clone());
+        }
+
+        if let Some(file_path) = &firmware_file.file_path {
+            let data = std::fs::read(file_path)?;
+            let arc_data = Arc::new(data);
+            firmware_file.data = Some(arc_data.clone());
+            Ok(arc_data)
+        } else {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "No data or file path available"))
+        }
+    }
+
+    /// Extract model prefix from firmware filename
+    /// Example: "P3219-PLE_11_11_148.bin" -> "P3219-PLE"
+    pub fn extract_model_from_firmware_filename(filename: &str) -> Option<String> {
+        let name_without_ext = filename.strip_suffix(".bin").unwrap_or(filename);
+
+        if let Some(underscore_pos) = name_without_ext.find('_') {
+            let model_part = &name_without_ext[..underscore_pos];
+            if !model_part.is_empty() {
+                return Some(model_part.to_string());
+            }
+        }
+
+        if let Some(version_start) = name_without_ext.find(char::is_numeric) {
+            let before_version = &name_without_ext[..version_start];
+            if before_version.len() > 1 && before_version.ends_with('_') {
+                let model_part = &before_version[..before_version.len() - 1];
+                if !model_part.is_empty() {
+                    return Some(model_part.to_string());
+                }
+            }
+        }
+
+        None
+    }
+}
+
 impl Default for FirmwareUpgradeOptions {
     fn default() -> Self {
         Self {
@@ -122,8 +248,6 @@ impl Default for FirmwareUpgradeOptions {
 /// VAPIX operations for Axis cameras
 #[derive(Debug)]
 pub struct CameraOperations {
-    /// Default timeout for requests (seconds)
-    timeout: Duration,
     /// Number of retries for failed requests
     retry_count: u32,
     /// Seconds to wait between retries
@@ -139,11 +263,13 @@ impl CameraOperations {
             .timeout(Duration::from_secs(10))
             .danger_accept_invalid_certs(true)
             .user_agent("Axis-Camera-Operations/1.0")
+            .pool_max_idle_per_host(3) // Reduced from 10 to 3 idle connections per host
+            .pool_idle_timeout(Duration::from_secs(30)) // Reduced from 90 to 30 seconds
+            .tcp_keepalive(Duration::from_secs(30)) // Reduced from 60 to 30 seconds
             .build()
             .map_err(CameraError::Request)?;
 
         Ok(Self {
-            timeout: Duration::from_secs(10),
             retry_count: 3,
             retry_delay: Duration::from_secs(2),
             client,
@@ -190,17 +316,15 @@ impl CameraOperations {
         let ha1 = Self::calculate_md5(&format!("{}:{}:{}", username, realm, password));
         let ha2 = Self::calculate_md5(&format!("{}:{}", method, uri));
 
-        let response = if let (Some(qop), Some(nc), Some(cnonce)) = (qop, nc, cnonce) {
+        if let (Some(qop), Some(nc), Some(cnonce)) = (qop, nc, cnonce) {
             Self::calculate_md5(&format!("{}:{}:{}:{}:{}:{}", ha1, nonce, nc, cnonce, qop, ha2))
         } else {
             Self::calculate_md5(&format!("{}:{}:{}", ha1, nonce, ha2))
-        };
-
-        response
+        }
     }
 
     /// Perform digest authentication manually for multipart requests
-    /// Perform digest authentication manually for multipart requests
+    // Custom digest auth implementation for multipart uploads since reqwest doesn't support digest+multipart
     async fn send_multipart_with_digest_auth(
         &self,
         url: reqwest::Url,
@@ -210,19 +334,30 @@ impl CameraOperations {
     ) -> Result<Response, CameraError> {
         // Step 1: Make initial GET request to the same endpoint to get digest challenge
         // This is more standard than POST and avoids potential issues
+        info!("Making initial request to {} to get digest challenge", url);
         let initial_response = self.client
             .get(url.clone())
+            .timeout(Duration::from_secs(30))
             .send().await
-            .map_err(CameraError::Request)?;
+            .map_err(|e| {
+                error!("Failed to make initial request for digest challenge: {}", e);
+                CameraError::Request(e)
+            })?;
+
+        info!("Initial response status: {}", initial_response.status());
 
         if initial_response.status() != 401 {
             // Try a POST request to trigger digest challenge
+            info!("GET request didn't return 401, trying POST to trigger digest challenge");
             let post_response = self.client
                 .post(url.clone())
+                .timeout(Duration::from_secs(30))
                 .send().await
                 .map_err(CameraError::Request)?;
 
+            info!("POST response status: {}", post_response.status());
             if post_response.status() != 401 {
+                error!("Neither GET nor POST returned 401 Unauthorized for digest challenge");
                 return Err(CameraError::HttpError {
                     ip: url.host_str().unwrap_or("unknown").to_string(),
                     status: post_response.status().as_u16(),
@@ -310,16 +445,21 @@ impl CameraOperations {
             auth_value.push_str(&format!(r#", algorithm={}"#, alg));
         }
 
+        info!("Generated digest auth header for firmware upload");
         debug!("Digest auth header: {}", auth_value);
 
         // Step 6: Make the actual request with digest auth
+        info!("Sending firmware multipart request to {}", url);
         let final_response = self.client
             .post(url)
             .header(AUTHORIZATION, auth_value)
             .multipart(form)
             .timeout(Duration::from_secs(300)) // Increase timeout for large firmware files
             .send().await
-            .map_err(CameraError::Request)?;
+            .map_err(|e| {
+                error!("Failed to send firmware upload request: {}", e);
+                CameraError::Request(e)
+            })?;
 
         Ok(final_response)
     }
@@ -346,27 +486,6 @@ impl CameraOperations {
         Ok(broadcast_addr.to_string())
     }
 
-    /// Create a new instance with custom settings
-    pub fn with_settings(
-        timeout: Duration,
-        retry_count: u32,
-        retry_delay: Duration
-    ) -> Result<Self, CameraError> {
-        let client = ClientBuilder::new()
-            .timeout(timeout)
-            .danger_accept_invalid_certs(true)
-            .user_agent("Axis-Camera-Operations/1.0")
-            .build()
-            .map_err(CameraError::Request)?;
-
-        Ok(Self {
-            timeout,
-            retry_count,
-            retry_delay,
-            client,
-        })
-    }
-
     /// Create initial administrator user on a factory-new camera
     ///
     /// For AXIS OS version 10, username must be 'root' and role must be Administrator
@@ -374,11 +493,10 @@ impl CameraOperations {
     pub async fn create_initial_admin(
         &self,
         temp_ip: Ipv4Addr,
-        _new_admin_user: &str, // Ignored, will use 'root'
+        _new_admin_user: &str,
         new_admin_pass: &str,
         protocol: Protocol
     ) -> Result<String, CameraError> {
-        // Force username to be 'root' for OS version 10
         let _admin_user = "root";
         let ip_str = temp_ip.to_string();
 
@@ -389,13 +507,12 @@ impl CameraOperations {
         let endpoint = "/axis-cgi/pwdgrp.cgi";
         let url = Url::parse(&base_url)?.join(endpoint)?;
 
-        // Parameters for the request - ensure we use required groups for OS v10
         let params = [
             ("action", "add"),
             ("user", "root"),
             ("pwd", new_admin_pass),
             ("grp", "root"),
-            ("sgrp", "admin:operator:viewer:ptz"), // Required security groups for OS v10
+            ("sgrp", "admin:operator:viewer:ptz"),
         ];
 
         for attempt in 1..=self.retry_count {
@@ -410,12 +527,9 @@ impl CameraOperations {
 
             let response_text = response.text().await.unwrap_or_default();
 
-            // Check for specific error cases
             if status_code == 401 || status_code == 403 {
-                // Camera might already have admin accounts set up
                 warn!("Authentication required for {} - camera may not be in factory-new state", ip_str);
 
-                // Try to check if user exists by attempting to authenticate
                 match
                     self.verify_admin_credentials(temp_ip, "root", new_admin_pass, protocol).await
                 {
@@ -459,7 +573,7 @@ impl CameraOperations {
     /// Set final static IP configuration on camera
     pub async fn set_final_static_ip(
         &self,
-        current_camera_ip: Ipv4Addr, // <-- This should be the CURRENT IP, not target IP
+        current_camera_ip: Ipv4Addr,
         admin_user: &str,
         admin_pass: &str,
         ip_config: &IpConfig,
@@ -478,10 +592,8 @@ impl CameraOperations {
 
         info!("Setting static IP {} on camera currently at {}", final_ip, current_ip_str);
 
-        // IMPORTANT: Use the CURRENT camera IP for the base URL, not the target IP
         let base_url = format!("{}://{}", protocol.scheme(), current_camera_ip);
 
-        // Try modern JSON API first, then fall back to legacy param.cgi API
         match
             self.set_ip_using_json_api(
                 &base_url,
@@ -507,32 +619,106 @@ impl CameraOperations {
         }
     }
 
-    /// This method performs the firmware upgrade by sending a multipart POST request
-    /// containing a JSON payload and the binary firmware file.
-    // Updated firmware upgrade method
-    pub async fn upgrade_firmware(
+    /// Upgrade firmware using model-to-firmware mapping for automatic model detection
+    pub async fn upgrade_firmware_with_model_mapping(
         &self,
         ip: Ipv4Addr,
         admin_user: &str,
         admin_pass: &str,
-        firmware_path: &Path,
+        firmware_mapping: &ModelFirmwareMapping,
+        protocol: Protocol,
+        options: Option<FirmwareUpgradeOptions>
+    ) -> Result<String, CameraError> {
+        let ip_str = ip.to_string();
+
+        info!("Retrieving device info for camera at {} to determine model", ip_str);
+        let device_info = self.get_device_info(ip, admin_user, admin_pass, protocol).await?;
+
+        let model_name = device_info
+            .get("ProdNbr")
+            .and_then(|v| v.as_str())
+            .or_else(|| device_info.get("ProductName").and_then(|v| v.as_str()))
+            .or_else(|| device_info.get("Brand").and_then(|v| v.as_str()))
+            .unwrap_or("Unknown Model");
+
+        info!("Detected camera model: '{}' for camera at {}", model_name, ip_str);
+
+        let firmware_file = firmware_mapping
+            .find_firmware_for_model(model_name)
+            .ok_or_else(|| CameraError::ModelIncompatible {
+                camera_model: model_name.to_string(),
+                compatible_models: firmware_mapping.firmware_files
+                    .iter()
+                    .map(|fw| fw.compatible_models.join(", "))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            })?;
+
+        info!(
+            "Found compatible firmware '{}' for model '{}' at {}",
+            firmware_file.filename,
+            model_name,
+            ip_str
+        );
+
+        let firmware_data = if let Some(data) = &firmware_file.data {
+            data.clone()
+        } else if let Some(file_path) = &firmware_file.file_path {
+            match std::fs::read(file_path) {
+                Ok(data) => Arc::new(data),
+                Err(e) => {
+                    return Err(CameraError::FirmwareUpgradeFailed {
+                        message: format!("Failed to load firmware file: {}", e),
+                    });
+                }
+            }
+        } else {
+            return Err(CameraError::FirmwareUpgradeFailed {
+                message: "No firmware data or file path available".to_string(),
+            });
+        };
+
+        self.upgrade_firmware_with_data(
+            ip,
+            admin_user,
+            admin_pass,
+            firmware_data,
+            firmware_file.filename.clone(),
+            protocol,
+            options
+        ).await
+    }
+
+    /// Upgrade firmware using pre-loaded firmware data (more efficient for multiple cameras)
+    pub async fn upgrade_firmware_with_data(
+        &self,
+        ip: Ipv4Addr,
+        admin_user: &str,
+        admin_pass: &str,
+        firmware_data: Arc<Vec<u8>>,
+        firmware_filename: String,
         protocol: Protocol,
         options: Option<FirmwareUpgradeOptions>
     ) -> Result<String, CameraError> {
         let ip_str = ip.to_string();
         let opts = options.unwrap_or_default();
 
-        info!("Starting firmware upgrade for camera at {}", ip_str);
+        info!(
+            "Starting firmware upgrade for camera at {} with pre-loaded data ({} bytes)",
+            ip_str,
+            firmware_data.len()
+        );
 
-        // 1. Read firmware file into memory
-        let firmware_data = tokio::fs
-            ::read(firmware_path).await
-            .with_context(|| format!("Failed to read firmware file: {:?}", firmware_path))
-            .map_err(|e| CameraError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, e)))?;
+        if firmware_data.is_empty() {
+            return Err(CameraError::FirmwareUpgradeFailed {
+                message: "Firmware data is empty".to_string(),
+            });
+        }
 
-        info!("Read {} bytes from firmware file: {}", firmware_data.len(), firmware_path.display());
+        if !firmware_filename.ends_with(".bin") {
+            warn!("Firmware filename does not end with .bin: {}", firmware_filename);
+        }
 
-        // 2. Prepare the JSON payload
         let mut json_payload_value =
             json!({
             "apiVersion": "1.0",
@@ -553,9 +739,8 @@ impl CameraOperations {
         }
 
         let json_payload_str = serde_json::to_string(&json_payload_value)?;
-        debug!("JSON Payload for firmware upgrade: {}", json_payload_str);
+        info!("JSON Payload for firmware upgrade: {}", json_payload_str);
 
-        // 3. Construct the multipart/form-data request
         let base_url = format!("{}://{}", protocol.scheme(), ip);
         let endpoint = "/axis-cgi/firmwaremanagement.cgi";
         let url = Url::parse(&base_url)?.join(endpoint)?;
@@ -563,38 +748,59 @@ impl CameraOperations {
         for attempt in 1..=self.retry_count {
             info!("Uploading firmware to {} (Attempt {}/{})", ip_str, attempt, self.retry_count);
 
-            // Create the JSON part - this should be named "payload" for Axis cameras
             let json_part = multipart::Part
                 ::text(json_payload_str.clone())
                 .mime_str("application/json")
-                .map_err(|e| CameraError::Request(e.into()))?;
-
-            // Create the file part - this should be named "file" for Axis cameras
-            let filename = firmware_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|s| s.to_owned())
-                .unwrap_or_else(|| "firmware.bin".to_string());
+                .map_err(CameraError::Request)?;
 
             let file_part = multipart::Part
-                ::bytes(firmware_data.clone())
-                .file_name(filename)
+                ::bytes((*firmware_data).clone())
+                .file_name(firmware_filename.clone())
                 .mime_str("application/octet-stream")
-                .map_err(|e| CameraError::Request(e.into()))?;
+                .map_err(CameraError::Request)?;
 
-            // Create form using the exact field names expected by Axis API
-            let form = multipart::Form
-                ::new()
-                .part("payload", json_part) // Must be named "payload"
-                .part("file", file_part); // Must be named "file"
+            let form = multipart::Form::new().part("payload", json_part).part("file", file_part);
 
-            // Send the request with manual digest auth
-            let response = self.send_multipart_with_digest_auth(
-                url.clone(),
-                form,
-                admin_user,
-                admin_pass
-            ).await?;
+            let response = match
+                self.client
+                    .post(url.clone())
+                    .basic_auth(admin_user, Some(admin_pass))
+                    .multipart(form)
+                    .timeout(Duration::from_secs(300))
+                    .send().await
+            {
+                Ok(resp) if resp.status().is_success() => resp,
+                Ok(resp) if resp.status() == 401 => {
+                    info!("Basic auth failed, trying digest auth for firmware upload");
+                    let json_part = multipart::Part
+                        ::text(json_payload_str.clone())
+                        .mime_str("application/json")
+                        .map_err(CameraError::Request)?;
+
+                    let file_part = multipart::Part
+                        ::bytes((*firmware_data).clone())
+                        .file_name(firmware_filename.clone())
+                        .mime_str("application/octet-stream")
+                        .map_err(CameraError::Request)?;
+
+                    let digest_form = multipart::Form
+                        ::new()
+                        .part("payload", json_part)
+                        .part("file", file_part);
+
+                    self.send_multipart_with_digest_auth(
+                        url.clone(),
+                        digest_form,
+                        admin_user,
+                        admin_pass
+                    ).await?
+                }
+                Ok(resp) => resp,
+                Err(e) => {
+                    error!("Failed to send firmware upload request: {}", e);
+                    return Err(CameraError::Request(e));
+                }
+            };
 
             let status = response.status();
             let status_code = status.as_u16();
@@ -603,30 +809,45 @@ impl CameraOperations {
                 let response_text = response.text().await.map_err(CameraError::Request)?;
                 info!("Firmware upload response (HTTP {}): {}", status_code, response_text);
 
-                // Parse response and handle success (keep your existing logic here)
                 match serde_json::from_str::<Value>(&response_text) {
                     Ok(json_response) => {
                         if let Some(error) = json_response.get("error") {
+                            let error_code = error
+                                .get("code")
+                                .and_then(|c| c.as_i64())
+                                .unwrap_or(-1);
                             let error_msg = error
                                 .get("message")
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("Unknown firmware upgrade error");
+
+                            error!(
+                                "Firmware upgrade API error (code {}): {}",
+                                error_code,
+                                error_msg
+                            );
                             return Err(CameraError::FirmwareUpgradeFailed {
-                                message: error_msg.to_string(),
+                                message: format!("API Error {}: {}", error_code, error_msg),
                             });
                         }
 
-                        let new_version = json_response
-                            .get("data")
-                            .and_then(|d| d.get("firmwareVersion"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("Unknown Version");
+                        let new_version = if let Some(data) = json_response.get("data") {
+                            let version = data
+                                .get("firmwareVersion")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Unknown Version");
 
-                        info!("Firmware upload successful. Camera reported new version: {}", new_version);
+                            info!("Firmware upload successful. Camera reported new version: {}", version);
+                            version.to_string()
+                        } else {
+                            info!(
+                                "Firmware upload appears successful (no version info returned yet)"
+                            );
+                            "Unknown Version".to_string()
+                        };
 
-                        // Wait for camera reboot and verification logic...
                         info!("Camera will reboot now. Waiting for it to come back online...");
-                        tokio::time::sleep(Duration::from_secs(15)).await;
+                        tokio::time::sleep(Duration::from_secs(10)).await;
 
                         match
                             super::network_utilities::wait_for_camera_online(
@@ -634,8 +855,8 @@ impl CameraOperations {
                                 admin_user,
                                 admin_pass,
                                 super::network_utilities::Protocol::Http,
-                                Duration::from_secs(120),
-                                Duration::from_secs(5)
+                                Duration::from_secs(90), // Reduced to 1.5 minutes to match actual firmware completion time
+                                Duration::from_secs(2) // Check every 2 seconds for more responsive detection
                             ).await
                         {
                             Ok((true, elapsed_time)) => {
@@ -646,20 +867,44 @@ impl CameraOperations {
                                 );
                             }
                             Ok((false, _)) => {
-                                warn!("Camera at {} did not come back online within timeout after firmware upgrade.", ip_str);
-                                return Err(CameraError::FirmwareUpgradeFailed {
-                                    message: "Camera did not reboot and come online after upgrade.".to_string(),
-                                });
+                                warn!("Camera at {} authentication timeout, but checking basic connectivity...", ip_str);
+
+                                if
+                                    let Ok(true) = super::network_utilities::ping_host(
+                                        ip,
+                                        1,
+                                        Duration::from_secs(3)
+                                    ).await
+                                {
+                                    info!("Camera at {} is responding to ping after firmware upgrade - considering success", ip_str);
+                                } else {
+                                    return Err(CameraError::FirmwareUpgradeFailed {
+                                        message: "Camera did not reboot and come online after upgrade.".to_string(),
+                                    });
+                                }
                             }
                             Err(e) => {
-                                error!("Error while waiting for camera to come online after upgrade: {}", e);
-                                return Err(CameraError::FirmwareUpgradeFailed {
-                                    message: format!("Error during post-upgrade reboot wait: {}", e),
-                                });
+                                warn!(
+                                    "Error waiting for camera at {} after upgrade: {}",
+                                    ip_str,
+                                    e
+                                );
+                                if
+                                    let Ok(true) = super::network_utilities::ping_host(
+                                        ip,
+                                        1,
+                                        Duration::from_secs(3)
+                                    ).await
+                                {
+                                    info!("Camera at {} is responding to ping after firmware upgrade - considering success", ip_str);
+                                } else {
+                                    return Err(CameraError::FirmwareUpgradeFailed {
+                                        message: format!("Error during post-upgrade reboot wait: {}", e),
+                                    });
+                                }
                             }
                         }
 
-                        // Handle firmware commit logic if needed...
                         if opts.commit_automatically && opts.auto_rollback_timeout.is_some() {
                             info!("Attempting to commit firmware upgrade for {}", ip_str);
                             match
@@ -715,85 +960,6 @@ impl CameraOperations {
         }
         unreachable!("Should have returned or errored before this point in firmware upgrade.");
     }
-    /// Get current firmware status
-    pub async fn get_firmware_status(
-        &self,
-        ip: Ipv4Addr,
-        admin_user: &str,
-        admin_pass: &str,
-        protocol: Protocol
-    ) -> Result<FirmwareStatus, CameraError> {
-        let base_url = format!("{}://{}", protocol.scheme(), ip);
-        let endpoint = "/axis-cgi/firmwaremanagement.cgi";
-        let url = Url::parse(&base_url)?.join(endpoint)?;
-
-        let json_payload =
-            json!({
-            "apiVersion": "1.0", // Use 1.0 as per docs
-            "context": "status_check_tool",
-            "method": "status"
-        });
-
-        let response = self.client
-            .post(url)
-            .json(&json_payload)
-            .send_with_digest_auth(admin_user, admin_pass).await?;
-
-        let status = response.status();
-        let status_code = status.as_u16();
-
-        if status.is_success() {
-            let response_text = response.text().await.map_err(CameraError::Request)?;
-            let json_response: Value = serde_json::from_str(&response_text)?;
-
-            if let Some(error) = json_response.get("error") {
-                let error_msg = error
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("Unknown error");
-                return Err(CameraError::FirmwareUpgradeFailed { // Re-use this error type or create a new StatusError
-                    message: format!("Firmware status API error: {}", error_msg),
-                });
-            }
-
-            if let Some(data) = json_response.get("data") {
-                let status = FirmwareStatus {
-                    active_firmware_version: data
-                        .get("activeFirmwareVersion")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Unknown")
-                        .to_string(),
-                    inactive_firmware_version: data
-                        .get("inactiveFirmwareVersion")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    is_committed: data
-                        .get("isCommited") // Note: Axis API uses "isCommited" (typo)
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true),
-                    time_to_rollback: data
-                        .get("timeToRollback")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as u32),
-                    last_upgrade_at: data
-                        .get("lastUpgradeAt")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                };
-
-                return Ok(status);
-            } else {
-                return Err(CameraError::FirmwareUpgradeFailed {
-                    message: "Firmware status data not found in response".to_string(),
-                });
-            }
-        }
-
-        Err(CameraError::HttpError {
-            ip: ip.to_string(),
-            status: status_code,
-        })
-    }
 
     pub async fn get_device_info(
         &self,
@@ -842,6 +1008,77 @@ impl CameraOperations {
         }
     }
 
+    /// Get network interface information including MAC address
+    pub async fn get_network_interface_info(
+        &self,
+        ip: Ipv4Addr,
+        admin_user: &str,
+        admin_pass: &str,
+        protocol: Protocol
+    ) -> Result<Option<String>, CameraError> {
+        let base_url = format!("{}://{}", protocol.scheme(), ip);
+        let endpoint = "/axis-cgi/network_settings.cgi";
+        let url = Url::parse(&base_url)?.join(endpoint)?;
+
+        let json_payload =
+            json!({
+            "apiVersion": "1.0",
+            "context": "get_network_info",
+            "method": "getNetworkInterfaces"
+        });
+
+        let response = self.client
+            .post(url)
+            .json(&json_payload)
+            .send_with_digest_auth(admin_user, admin_pass).await?;
+
+        let status = response.status();
+        if status.is_success() {
+            let response_text = response.text().await.map_err(CameraError::Request)?;
+            debug!("Network interface response: {}", response_text);
+
+            match serde_json::from_str::<Value>(&response_text) {
+                Ok(json_response) => {
+                    if let Some(error) = json_response.get("error") {
+                        let error_msg = error
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("Unknown error");
+                        warn!("Network interface API error: {}", error_msg);
+                        return Ok(None);
+                    }
+
+                    if let Some(data) = json_response.get("data") {
+                        if
+                            let Some(interfaces) = data
+                                .get("networkInterfaces")
+                                .and_then(|n| n.as_array())
+                        {
+                            for interface in interfaces {
+                                if
+                                    let Some(mac) = interface
+                                        .get("macAddress")
+                                        .and_then(|m| m.as_str())
+                                {
+                                    info!("Found MAC address via VAPIX: {}", mac);
+                                    return Ok(Some(mac.to_string()));
+                                }
+                            }
+                        }
+                    }
+                    Ok(None)
+                }
+                Err(e) => {
+                    debug!("Failed to parse network interface response: {}", e);
+                    Ok(None)
+                }
+            }
+        } else {
+            debug!("Network interface request failed with status: {}", status);
+            Ok(None)
+        }
+    }
+
     /// Commit firmware upgrade (prevents auto-rollback)
     pub async fn commit_firmware_upgrade(
         &self,
@@ -856,7 +1093,7 @@ impl CameraOperations {
 
         let json_payload =
             json!({
-            "apiVersion": "1.0", // Use 1.0 as per docs
+            "apiVersion": "1.0",
             "context": "commit_upgrade_tool",
             "method": "commit"
         });
@@ -892,60 +1129,6 @@ impl CameraOperations {
         }
     }
 
-    /// Rollback to previous firmware version
-    pub async fn rollback_firmware(
-        &self,
-        ip: Ipv4Addr,
-        admin_user: &str,
-        admin_pass: &str,
-        protocol: Protocol
-    ) -> Result<String, CameraError> {
-        let base_url = format!("{}://{}", protocol.scheme(), ip);
-        let endpoint = "/axis-cgi/firmwaremanagement.cgi";
-        let url = Url::parse(&base_url)?.join(endpoint)?;
-
-        let json_payload =
-            json!({
-            "apiVersion": "1.3",
-            "context": "rollback",
-            "method": "rollback"
-        });
-
-        let response = self.client
-            .post(url)
-            .basic_auth(admin_user, Some(admin_pass))
-            .json(&json_payload)
-            .send().await
-            .map_err(CameraError::Request)?;
-
-        let status = response.status();
-        let status_code = status.as_u16();
-
-        if status.is_success() {
-            let response_text = response.text().await.map_err(CameraError::Request)?;
-            let json_response: Value = serde_json::from_str(&response_text)?;
-
-            if let Some(error) = json_response.get("error") {
-                let error_msg = error
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("Unknown error");
-                return Err(CameraError::FirmwareUpgradeFailed {
-                    message: error_msg.to_string(),
-                });
-            }
-
-            Ok("Firmware rollback initiated successfully".to_string())
-        } else {
-            Err(CameraError::HttpError {
-                ip: ip.to_string(),
-                status: status_code,
-            })
-        }
-    }
-
-    // Private helper methods
-
     /// Make HTTP request with form parameters
     async fn make_request_with_params(
         &self,
@@ -955,12 +1138,10 @@ impl CameraOperations {
     ) -> Result<Response, CameraError> {
         let mut request = self.client.get(url.clone());
 
-        // Add authentication if provided
         if let Some((username, password)) = auth {
             request = request.basic_auth(username, Some(password));
         }
 
-        // Add parameters
         for (key, value) in params {
             request = request.query(&[(key, value)]);
         }
@@ -1033,13 +1214,12 @@ impl CameraOperations {
 
         info!("Sending network configuration payload: {}", serde_json::to_string_pretty(&payload)?);
 
-        // diqwest handles the entire 401 challenge and response flow automatically!
         let response = self.client
             .post(url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .json(&payload)
-            .send_with_digest_auth(admin_user, admin_pass).await?; // This is the magic line
+            .send_with_digest_auth(admin_user, admin_pass).await?;
 
         let status = response.status();
         info!("Final response status after digest auth: {}", status);
@@ -1059,14 +1239,14 @@ impl CameraOperations {
                     });
                 }
             }
-            return Ok(format!("Static IP successfully set to {}", final_ip));
+            Ok(format!("Static IP successfully set to {}", final_ip))
         } else {
             let error_text = response.text().await.unwrap_or_default();
             error!("Request failed with status {} and body: {}", status, error_text);
-            return Err(CameraError::HttpError {
+            Err(CameraError::HttpError {
                 ip: final_ip.to_string(),
                 status: status.as_u16(),
-            });
+            })
         }
     }
 
@@ -1140,7 +1320,6 @@ impl CameraOperations {
         let mask_bits = u32::from(mask_addr);
         let prefix_len = mask_bits.leading_ones() as u8;
 
-        // Validate it's a proper subnet mask (contiguous 1s followed by contiguous 0s)
         let expected_mask = (0xffffffff_u32).checked_shl(32 - (prefix_len as u32)).unwrap_or(0);
 
         if mask_bits != expected_mask {

@@ -8,10 +8,8 @@ use byteorder::{ BigEndian, ByteOrder };
 use chrono::{ DateTime, Utc };
 use log::{ debug, error, info, warn };
 use network_interface::{ NetworkInterface as NetInterface, NetworkInterfaceConfig };
-use rand::prelude::*;
-use rand::rngs::StdRng; // This is Send-compatible
 use socket2::{ Domain, Protocol, Socket, Type };
-use std::collections::HashMap;
+use std::collections::{ HashMap, VecDeque };
 use std::net::{ Ipv4Addr, SocketAddr, SocketAddrV4 };
 use std::sync::atomic::{ AtomicBool, Ordering };
 use std::sync::Arc;
@@ -97,6 +95,7 @@ pub struct DhcpPacket {
 
 impl DhcpPacket {
     /// Parse a DHCP packet from raw bytes
+    // Parse raw DHCP packet bytes into structured packet for camera discovery
     pub fn parse(data: &[u8]) -> Result<Self, DhcpError> {
         if data.len() < 240 {
             return Err(DhcpError::PacketParsing("Packet too short for DHCP".to_string()));
@@ -121,7 +120,8 @@ impl DhcpPacket {
         packet.chaddr.copy_from_slice(&data[28..44]);
 
         // Check for magic cookie at offset 236
-        if data.len() > 240 && &data[236..240] == &[0x63, 0x82, 0x53, 0x63] {
+        // Check for DHCP magic cookie to identify valid DHCP packets
+        if data.len() > 240 && data[236..240] == [0x63, 0x82, 0x53, 0x63] {
             packet.options = Self::parse_options(&data[240..])?;
         }
 
@@ -255,7 +255,7 @@ pub struct DhcpManager {
     interface: Option<String>,
 
     leases: Arc<RwLock<HashMap<[u8; 6], DhcpLease>>>,
-    available_ips: Arc<RwLock<Vec<Ipv4Addr>>>,
+    available_ips: Arc<RwLock<VecDeque<Ipv4Addr>>>,
     is_running: Arc<AtomicBool>,
 }
 
@@ -270,7 +270,7 @@ impl DhcpManager {
             lease_time: Duration::from_secs(3600), // 1 hour
             interface: None,
             leases: Arc::new(RwLock::new(HashMap::new())),
-            available_ips: Arc::new(RwLock::new(Vec::new())),
+            available_ips: Arc::new(RwLock::new(VecDeque::new())),
             is_running: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -395,10 +395,10 @@ impl DhcpManager {
         }
 
         // Use Send-compatible RNG
-        let mut rng = StdRng::from_os_rng();
-        ips.shuffle(&mut rng);
+        // let mut rng = StdRng::from_os_rng();
+        // ips.shuffle(&mut rng);
 
-        *self.available_ips.write().await = ips;
+        *self.available_ips.write().await = ips.into();
 
         info!(
             "Generated IP pool with {} available addresses",
@@ -409,7 +409,16 @@ impl DhcpManager {
     }
 
     /// Start the DHCP server
-    pub async fn start(&self, mut shutdown_rx: mpsc::Receiver<()>) -> Result<(), DhcpError> {
+    pub async fn start(&self, shutdown_rx: mpsc::Receiver<()>) -> Result<(), DhcpError> {
+        self.start_with_lease_updates(shutdown_rx, None).await
+    }
+
+    /// Start the DHCP server with real-time lease updates
+    pub async fn start_with_lease_updates(
+        &self,
+        mut shutdown_rx: mpsc::Receiver<()>,
+        lease_update_tx: Option<mpsc::UnboundedSender<Vec<DhcpLease>>>
+    ) -> Result<(), DhcpError> {
         if self.is_running.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -434,7 +443,7 @@ impl DhcpManager {
         self.is_running.store(true, Ordering::Relaxed);
         info!("DHCP server started on port 67");
 
-        let mut buffer = vec![0u8; 4096];
+        let mut buffer = vec![0u8; 1500]; // Reduced from 4096 to 1500 (standard MTU size)
 
         loop {
             tokio::select! {
@@ -446,7 +455,7 @@ impl DhcpManager {
                 result = timeout(Duration::from_secs(1), socket.recv_from(&mut buffer)) => {
                     match result {
                         Ok(Ok((len, addr))) => {
-                            if let Err(e) = self.process_dhcp_packet(&buffer[..len], addr, &socket).await {
+                            if let Err(e) = self.process_dhcp_packet(&buffer[..len], addr, &socket, &lease_update_tx).await {
                                 error!("Error processing DHCP packet: {}", e);
                             }
                         }
@@ -472,16 +481,17 @@ impl DhcpManager {
         &self,
         data: &[u8],
         _addr: SocketAddr,
-        socket: &UdpSocket
+        socket: &UdpSocket,
+        lease_update_tx: &Option<mpsc::UnboundedSender<Vec<DhcpLease>>>
     ) -> Result<(), DhcpError> {
         let packet = DhcpPacket::parse(data)?;
 
         match packet.get_message_type() {
             Some(DhcpMessageType::Discover) => {
-                self.handle_dhcp_discover(&packet, socket).await?;
+                self.handle_dhcp_discover(&packet, socket, lease_update_tx).await?;
             }
             Some(DhcpMessageType::Request) => {
-                self.handle_dhcp_request(&packet, socket).await?;
+                self.handle_dhcp_request(&packet, socket, lease_update_tx).await?;
             }
             _ => {
                 // Ignore other message types for now
@@ -496,7 +506,8 @@ impl DhcpManager {
     async fn handle_dhcp_discover(
         &self,
         packet: &DhcpPacket,
-        socket: &UdpSocket
+        socket: &UdpSocket,
+        lease_update_tx: &Option<mpsc::UnboundedSender<Vec<DhcpLease>>>
     ) -> Result<(), DhcpError> {
         let mac = packet.get_mac();
         let now = Utc::now();
@@ -521,7 +532,7 @@ impl DhcpManager {
                 return Ok(());
             }
 
-            let new_ip = available_ips.remove(0);
+            let new_ip = available_ips.pop_front().expect("IP pool not empty");
             drop(available_ips); // Explicitly drop the lock
 
             // Create lease
@@ -537,6 +548,13 @@ impl DhcpManager {
         };
 
         self.send_dhcp_offer(packet, offer_ip, socket).await?;
+
+        // Send lease update to GUI
+        if let Some(tx) = lease_update_tx {
+            let active_leases = self.get_active_leases().await;
+            let _ = tx.send(active_leases);
+        }
+
         Ok(())
     }
 
@@ -544,7 +562,8 @@ impl DhcpManager {
     async fn handle_dhcp_request(
         &self,
         packet: &DhcpPacket,
-        socket: &UdpSocket
+        socket: &UdpSocket,
+        lease_update_tx: &Option<mpsc::UnboundedSender<Vec<DhcpLease>>>
     ) -> Result<(), DhcpError> {
         let mac = packet.get_mac();
         let now = Utc::now();
@@ -568,6 +587,12 @@ impl DhcpManager {
                 mac[5],
                 lease_ip
             );
+
+            // Send lease update to GUI
+            if let Some(tx) = lease_update_tx {
+                let active_leases = self.get_active_leases().await;
+                let _ = tx.send(active_leases);
+            }
         }
 
         Ok(())
@@ -654,11 +679,6 @@ impl DhcpManager {
             .filter(|lease| lease.lease_end > now)
             .cloned()
             .collect()
-    }
-
-    /// Check if server is running
-    pub fn is_running(&self) -> bool {
-        self.is_running.load(Ordering::Relaxed)
     }
 }
 

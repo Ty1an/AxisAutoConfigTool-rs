@@ -16,7 +16,7 @@
 //! (ping, HTTP requests, port checks) for maximum reliability across
 //! different network environments and camera firmware versions.
 
-use anyhow::{ Context, Result };
+use anyhow::Result;
 use ipnetwork::Ipv4Network;
 use log::{ debug, error, info, warn };
 use reqwest::{ Client, ClientBuilder };
@@ -26,7 +26,7 @@ use std::net::{ IpAddr, Ipv4Addr, SocketAddr };
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpStream;
-use tokio::process::Command;
+use surge_ping::ping;
 use tokio::time::{ sleep, timeout, Instant };
 use url::Url;
 
@@ -230,45 +230,28 @@ pub async fn wait_for_camera_online(
     Ok((false, start_time.elapsed()))
 }
 
-/// Ping a host to check if it's online
+/// Ping a host to check if it's online using async surge-ping
 pub async fn ping_host(
     ip: Ipv4Addr,
     count: u32,
     timeout_duration: Duration
 ) -> Result<bool, NetworkError> {
-    let mut cmd = Command::new("ping");
+    let mut successful_pings = 0;
 
-    // Platform-specific ping command arguments
-    #[cfg(windows)]
-    {
-        cmd.args([
-            "-n",
-            &count.to_string(),
-            "-w",
-            &(timeout_duration.as_millis() as u64).to_string(),
-            &ip.to_string(),
-        ]);
+    for _i in 0..count {
+        let result = timeout(timeout_duration, ping(IpAddr::V4(ip), &[])).await;
+
+        match result {
+            Ok(Ok(_)) => {
+                successful_pings += 1;
+            }
+            Ok(Err(_)) => {} // Ping failed but no timeout
+            Err(_) => {} // Timeout occurred
+        }
     }
 
-    #[cfg(not(windows))]
-    {
-        cmd.args([
-            "-c",
-            &count.to_string(),
-            "-W",
-            &timeout_duration.as_secs().to_string(),
-            &ip.to_string(),
-        ]);
-    }
-
-    // Run ping command with additional timeout margin
-    let output = timeout(timeout_duration + Duration::from_secs(1), cmd.output()).await
-        .map_err(|_| NetworkError::Timeout {
-            timeout_secs: timeout_duration.as_secs() + 1,
-        })?
-        .map_err(NetworkError::Io)?;
-
-    Ok(output.status.success())
+    // Consider successful if at least one ping succeeds
+    Ok(successful_pings > 0)
 }
 
 /// Validate IP address format and provide detailed feedback

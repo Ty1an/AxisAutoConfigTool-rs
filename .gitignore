@@ -2,3 +2,4 @@
 build.rs
 # Operating System specific files
 .DS_Store
+CLAUDE.md

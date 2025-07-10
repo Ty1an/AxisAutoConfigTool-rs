@@ -2,7 +2,7 @@
 //! Camera discovery module
 
 use anyhow::Result;
-use log::{ debug, info, warn };
+use log::{ debug, info };
 use reqwest::{ Client, ClientBuilder, Method };
 use serde::{ Deserialize, Serialize };
 use std::collections::HashMap;
@@ -10,7 +10,6 @@ use std::net::{ IpAddr, Ipv4Addr, SocketAddr };
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpStream;
-use tokio::process::Command;
 use tokio::time::timeout;
 use url::Url;
 
@@ -51,6 +50,8 @@ pub struct DeviceInfo {
     pub server_header: Option<String>,
     pub authentication_type: Option<String>,
     pub response_time_ms: Option<u64>,
+    pub mac_address: Option<String>,
+    pub model_name: Option<String>,
 }
 
 /// Camera discovery functionality for Axis cameras
@@ -69,6 +70,9 @@ impl CameraDiscovery {
             .timeout(Duration::from_secs(2))
             .danger_accept_invalid_certs(true)
             .user_agent("Axis-Camera-Discovery/1.0")
+            .pool_max_idle_per_host(2) // Reduced from 5 to 2 idle connections per host
+            .pool_idle_timeout(Duration::from_secs(15)) // Reduced from 30 to 15 seconds
+            .tcp_keepalive(Duration::from_secs(15)) // Reduced from 30 to 15 seconds
             .build()
             .map_err(DiscoveryError::Request)?;
 
@@ -84,6 +88,9 @@ impl CameraDiscovery {
             .timeout(timeout)
             .danger_accept_invalid_certs(true)
             .user_agent("Axis-Camera-Discovery/1.0")
+            .pool_max_idle_per_host(2) // Reduced from 5 to 2
+            .pool_idle_timeout(Duration::from_secs(15)) // Reduced from 30 to 15 seconds
+            .tcp_keepalive(Duration::from_secs(15)) // Reduced from 30 to 15 seconds
             .build()
             .map_err(DiscoveryError::Request)?;
 
@@ -246,30 +253,13 @@ impl CameraDiscovery {
 
     /// Check if a device responds to ping
     async fn check_ping(&self, ip: Ipv4Addr) -> Result<bool, DiscoveryError> {
-        let ip_str = ip.to_string();
-
-        let mut cmd = Command::new("ping");
-
-        // Platform-specific ping command
-        #[cfg(windows)]
-        {
-            cmd.args(["-n", "1", "-w", &(self.timeout.as_millis() as u64).to_string(), &ip_str]);
-        }
-
-        #[cfg(not(windows))]
-        {
-            cmd.args(["-c", "1", "-W", &self.timeout.as_secs().to_string(), &ip_str]);
-        }
-
-        // Run ping command with additional timeout margin
-        let output = timeout(self.timeout + Duration::from_secs(1), cmd.output()).await
-            .map_err(|_| DiscoveryError::Timeout { ip: ip_str.clone() })?
+        // Use the optimized ping function from network_utilities
+        crate::network_utilities
+            ::ping_host(ip, 1, self.timeout).await
             .map_err(|e| DiscoveryError::ConnectionFailed {
-                ip: ip_str.clone(),
-                reason: format!("Ping subprocess error: {}", e),
-            })?;
-
-        Ok(output.status.success())
+                ip: ip.to_string(),
+                reason: format!("Ping failed: {}", e),
+            })
     }
 
     /// Check if a device has an open HTTP port (80)
@@ -342,6 +332,8 @@ impl CameraDiscovery {
             server_header: None,
             authentication_type: None,
             response_time_ms: Some(response_time),
+            mac_address: None,
+            model_name: None,
         };
 
         // If device is responsive, try to get more detailed information
@@ -350,6 +342,7 @@ impl CameraDiscovery {
                 device_info.device_type = details.device_type;
                 device_info.server_header = details.server_header;
                 device_info.authentication_type = details.authentication_type;
+                device_info.model_name = details.model_name;
             }
         }
 
@@ -396,11 +389,18 @@ impl CameraDiscovery {
             });
 
         let device_type = if
-            server_header.as_ref().map_or(false, |s| s.to_lowercase().contains("axis"))
+            server_header.as_ref().is_some_and(|s| s.to_lowercase().contains("axis"))
         {
             Some("axis_camera".to_string())
         } else {
             Some("unknown_device".to_string())
+        };
+
+        // Try to get model information if we have credentials
+        let model_name = if let (Some(user), Some(pass)) = (username, password) {
+            self.try_get_model_info(ip, user, pass).await
+        } else {
+            None
         };
 
         Ok(DeviceInfo {
@@ -410,7 +410,57 @@ impl CameraDiscovery {
             server_header,
             authentication_type: auth_type,
             response_time_ms: None,
+            mac_address: None, // Could be enhanced to get from DHCP later
+            model_name,
         })
+    }
+
+    /// Try to get model information from camera using basic device info API
+    async fn try_get_model_info(&self, ip: Ipv4Addr, username: &str, password: &str) -> Option<String> {
+        let base_url = format!("http://{}", ip);
+        let endpoint = "/axis-cgi/basicdeviceinfo.cgi";
+        
+        if let Ok(url) = url::Url::parse(&base_url).and_then(|u| u.join(endpoint)) {
+            let json_payload = serde_json::json!({
+                "apiVersion": "1.0",
+                "context": "discovery_model_detection",
+                "method": "getAllProperties"
+            });
+
+            if let Ok(response) = self.client
+                .post(url)
+                .json(&json_payload)
+                .basic_auth(username, Some(password))
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+            {
+                if response.status().is_success() {
+                    if let Ok(response_text) = response.text().await {
+                        if let Ok(json_response) = serde_json::from_str::<serde_json::Value>(&response_text) {
+                            // Try to extract model from various possible fields
+                            if let Some(data) = json_response.get("data") {
+                                if let Some(property_list) = data.get("propertyList") {
+                                    // Check for product number first (most specific)
+                                    if let Some(prod_nbr) = property_list.get("ProdNbr") {
+                                        if let Some(model_str) = prod_nbr.as_str() {
+                                            return Some(model_str.to_string());
+                                        }
+                                    }
+                                    // Fallback to product name
+                                    if let Some(prod_name) = property_list.get("ProductName") {
+                                        if let Some(model_str) = prod_name.as_str() {
+                                            return Some(model_str.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Batch check multiple IP addresses for Axis cameras
@@ -454,8 +504,9 @@ impl CameraDiscovery {
         let mut discovered_devices = Vec::new();
         let max_find = max_cameras.unwrap_or(50); // Stop after finding this many
 
-        // Use much more aggressive concurrency for faster scanning
-        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(50));
+        // Use aggressive concurrency for faster scanning (optimized for 25-50 camera deployments)
+        // High concurrency for fast network scanning - trade memory for speed
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(25));
         let devices = std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));
 
         let mut handles = Vec::new();
@@ -466,7 +517,8 @@ impl CameraDiscovery {
             // Check if we've found enough cameras
             {
                 let current_devices = devices.read().await;
-                if current_devices.len() >= max_find {
+                // Early exit when enough cameras found to avoid unnecessary network traffic
+            if current_devices.len() >= max_find {
                     info!("Found {} cameras, stopping scan early", current_devices.len());
                     break;
                 }
@@ -534,6 +586,8 @@ impl CameraDiscovery {
                 server_header: None,
                 authentication_type: None,
                 response_time_ms: Some(start_time.elapsed().as_millis() as u64),
+                mac_address: None,
+                model_name: None,
             });
         }
 
@@ -553,6 +607,8 @@ impl CameraDiscovery {
                 server_header: None,
                 authentication_type: None,
                 response_time_ms: Some(response_time),
+                mac_address: None,
+                model_name: None,
             })
         } else {
             Ok(DeviceInfo {
@@ -562,6 +618,8 @@ impl CameraDiscovery {
                 server_header: None,
                 authentication_type: None,
                 response_time_ms: Some(response_time),
+                mac_address: None,
+                model_name: None,
             })
         }
     }
