@@ -4,14 +4,14 @@
 //! factory-new Axis cameras with identical default IP addresses.
 
 use anyhow::Result;
-use byteorder::{ BigEndian, ByteOrder };
-use chrono::{ DateTime, Utc };
-use log::{ debug, error, info, warn };
-use network_interface::{ NetworkInterface as NetInterface, NetworkInterfaceConfig };
-use socket2::{ Domain, Protocol, Socket, Type };
-use std::collections::{ HashMap, VecDeque };
-use std::net::{ Ipv4Addr, SocketAddr, SocketAddrV4 };
-use std::sync::atomic::{ AtomicBool, Ordering };
+use byteorder::{BigEndian, ByteOrder};
+use chrono::{DateTime, Utc};
+use log::{debug, error, info, warn};
+use network_interface::{NetworkInterface as NetInterface, NetworkInterfaceConfig};
+use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::{HashMap, VecDeque};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -22,10 +22,14 @@ use tokio::time::timeout;
 
 #[derive(Error, Debug)]
 pub enum DhcpError {
-    #[error("Network error: {0}")] Network(#[from] std::io::Error),
-    #[error("Configuration error: {0}")] Config(String),
-    #[error("Packet parsing error: {0}")] PacketParsing(String),
-    #[error("Address error: {0}")] Address(String),
+    #[error("Network error: {0}")]
+    Network(#[from] std::io::Error),
+    #[error("Configuration error: {0}")]
+    Config(String),
+    #[error("Packet parsing error: {0}")]
+    PacketParsing(String),
+    #[error("Address error: {0}")]
+    Address(String),
 }
 
 /// DHCP Message Types
@@ -53,7 +57,10 @@ impl TryFrom<u8> for DhcpMessageType {
             5 => Ok(DhcpMessageType::Ack),
             6 => Ok(DhcpMessageType::Nak),
             7 => Ok(DhcpMessageType::Release),
-            _ => Err(DhcpError::PacketParsing(format!("Invalid DHCP message type: {}", value))),
+            _ => Err(DhcpError::PacketParsing(format!(
+                "Invalid DHCP message type: {}",
+                value
+            ))),
         }
     }
 }
@@ -78,13 +85,13 @@ pub struct DhcpLease {
 /// DHCP Packet structure
 #[derive(Debug, Clone)]
 pub struct DhcpPacket {
-    pub op: u8, // Message op code
-    pub htype: u8, // Hardware address type
-    pub hlen: u8, // Hardware address length
-    pub hops: u8, // Hops
-    pub xid: u32, // Transaction ID
-    pub secs: u16, // Seconds
-    pub flags: u16, // Flags
+    pub op: u8,           // Message op code
+    pub htype: u8,        // Hardware address type
+    pub hlen: u8,         // Hardware address length
+    pub hops: u8,         // Hops
+    pub xid: u32,         // Transaction ID
+    pub secs: u16,        // Seconds
+    pub flags: u16,       // Flags
     pub ciaddr: Ipv4Addr, // Client IP
     pub yiaddr: Ipv4Addr, // Your IP
     pub siaddr: Ipv4Addr, // Server IP
@@ -98,7 +105,9 @@ impl DhcpPacket {
     // Parse raw DHCP packet bytes into structured packet for camera discovery
     pub fn parse(data: &[u8]) -> Result<Self, DhcpError> {
         if data.len() < 240 {
-            return Err(DhcpError::PacketParsing("Packet too short for DHCP".to_string()));
+            return Err(DhcpError::PacketParsing(
+                "Packet too short for DHCP".to_string(),
+            ));
         }
 
         let mut packet = DhcpPacket {
@@ -183,7 +192,7 @@ impl DhcpPacket {
         server_ip: Ipv4Addr,
         offered_ip: Ipv4Addr,
         subnet_mask: Ipv4Addr,
-        lease_time: u32
+        lease_time: u32,
     ) -> Vec<u8> {
         let mut packet = vec![0u8; 240];
 
@@ -280,12 +289,10 @@ impl DhcpManager {
         let mut interfaces = Vec::new();
 
         let network_interfaces = NetInterface::show().map_err(|e| {
-            DhcpError::Network(
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to enumerate network interfaces: {}", e)
-                )
-            )
+            DhcpError::Network(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to enumerate network interfaces: {}", e),
+            ))
         })?;
 
         for interface in network_interfaces {
@@ -329,16 +336,17 @@ impl DhcpManager {
     fn parse_mac_address(mac_str: &str) -> Result<[u8; 6], DhcpError> {
         let parts: Vec<&str> = mac_str.split(':').collect();
         if parts.len() != 6 {
-            return Err(DhcpError::Address(format!("Invalid MAC address format: {}", mac_str)));
+            return Err(DhcpError::Address(format!(
+                "Invalid MAC address format: {}",
+                mac_str
+            )));
         }
 
         let mut mac = [0u8; 6];
         for (i, part) in parts.iter().enumerate() {
-            mac[i] = u8
-                ::from_str_radix(part, 16)
-                .map_err(|_| {
-                    DhcpError::Address(format!("Invalid MAC address format: {}", mac_str))
-                })?;
+            mac[i] = u8::from_str_radix(part, 16).map_err(|_| {
+                DhcpError::Address(format!("Invalid MAC address format: {}", mac_str))
+            })?;
         }
 
         Ok(mac)
@@ -351,12 +359,12 @@ impl DhcpManager {
         server_ip: Ipv4Addr,
         start_ip: Ipv4Addr,
         end_ip: Ipv4Addr,
-        lease_time: Duration
+        lease_time: Duration,
     ) -> Result<(), DhcpError> {
         if u32::from(start_ip) > u32::from(end_ip) {
-            return Err(
-                DhcpError::Config("Start IP must be less than or equal to end IP".to_string())
-            );
+            return Err(DhcpError::Config(
+                "Start IP must be less than or equal to end IP".to_string(),
+            ));
         }
 
         self.interface = Some(interface);
@@ -373,15 +381,15 @@ impl DhcpManager {
 
     /// Generate the IP address pool using Send-compatible RNG
     async fn generate_ip_pool(&self) -> Result<(), DhcpError> {
-        let start = self.start_ip.ok_or_else(|| {
-            DhcpError::Config("Start IP not configured".to_string())
-        })?;
-        let end = self.end_ip.ok_or_else(|| {
-            DhcpError::Config("End IP not configured".to_string())
-        })?;
-        let server_ip = self.server_ip.ok_or_else(|| {
-            DhcpError::Config("Server IP not configured".to_string())
-        })?;
+        let start = self
+            .start_ip
+            .ok_or_else(|| DhcpError::Config("Start IP not configured".to_string()))?;
+        let end = self
+            .end_ip
+            .ok_or_else(|| DhcpError::Config("End IP not configured".to_string()))?;
+        let server_ip = self
+            .server_ip
+            .ok_or_else(|| DhcpError::Config("Server IP not configured".to_string()))?;
 
         let mut ips = Vec::new();
         let start_u32 = u32::from(start);
@@ -417,15 +425,15 @@ impl DhcpManager {
     pub async fn start_with_lease_updates(
         &self,
         mut shutdown_rx: mpsc::Receiver<()>,
-        lease_update_tx: Option<mpsc::UnboundedSender<Vec<DhcpLease>>>
+        lease_update_tx: Option<mpsc::UnboundedSender<Vec<DhcpLease>>>,
     ) -> Result<(), DhcpError> {
         if self.is_running.load(Ordering::Relaxed) {
             return Ok(());
         }
 
-        let _server_ip = self.server_ip.ok_or_else(|| {
-            DhcpError::Config("Server not properly configured".to_string())
-        })?;
+        let _server_ip = self
+            .server_ip
+            .ok_or_else(|| DhcpError::Config("Server not properly configured".to_string()))?;
 
         // Create UDP socket using socket2 for more control, then convert to tokio
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -451,7 +459,7 @@ impl DhcpManager {
                     info!("Shutdown signal received");
                     break;
                 }
-                
+
                 result = timeout(Duration::from_secs(1), socket.recv_from(&mut buffer)) => {
                     match result {
                         Ok(Ok((len, addr))) => {
@@ -482,20 +490,25 @@ impl DhcpManager {
         data: &[u8],
         _addr: SocketAddr,
         socket: &UdpSocket,
-        lease_update_tx: &Option<mpsc::UnboundedSender<Vec<DhcpLease>>>
+        lease_update_tx: &Option<mpsc::UnboundedSender<Vec<DhcpLease>>>,
     ) -> Result<(), DhcpError> {
         let packet = DhcpPacket::parse(data)?;
 
         match packet.get_message_type() {
             Some(DhcpMessageType::Discover) => {
-                self.handle_dhcp_discover(&packet, socket, lease_update_tx).await?;
+                self.handle_dhcp_discover(&packet, socket, lease_update_tx)
+                    .await?;
             }
             Some(DhcpMessageType::Request) => {
-                self.handle_dhcp_request(&packet, socket, lease_update_tx).await?;
+                self.handle_dhcp_request(&packet, socket, lease_update_tx)
+                    .await?;
             }
             _ => {
                 // Ignore other message types for now
-                debug!("Ignoring DHCP message type: {:?}", packet.get_message_type());
+                debug!(
+                    "Ignoring DHCP message type: {:?}",
+                    packet.get_message_type()
+                );
             }
         }
 
@@ -507,7 +520,7 @@ impl DhcpManager {
         &self,
         packet: &DhcpPacket,
         socket: &UdpSocket,
-        lease_update_tx: &Option<mpsc::UnboundedSender<Vec<DhcpLease>>>
+        lease_update_tx: &Option<mpsc::UnboundedSender<Vec<DhcpLease>>>,
     ) -> Result<(), DhcpError> {
         let mac = packet.get_mac();
         let now = Utc::now();
@@ -516,7 +529,11 @@ impl DhcpManager {
         let offer_ip = {
             let leases = self.leases.read().await;
             if let Some(lease) = leases.get(&mac) {
-                if lease.lease_end > now { Some(lease.ip) } else { None }
+                if lease.lease_end > now {
+                    Some(lease.ip)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -563,7 +580,7 @@ impl DhcpManager {
         &self,
         packet: &DhcpPacket,
         socket: &UdpSocket,
-        lease_update_tx: &Option<mpsc::UnboundedSender<Vec<DhcpLease>>>
+        lease_update_tx: &Option<mpsc::UnboundedSender<Vec<DhcpLease>>>,
     ) -> Result<(), DhcpError> {
         let mac = packet.get_mac();
         let now = Utc::now();
@@ -579,13 +596,7 @@ impl DhcpManager {
 
             info!(
                 "DHCP lease renewed for MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, IP {}",
-                mac[0],
-                mac[1],
-                mac[2],
-                mac[3],
-                mac[4],
-                mac[5],
-                lease_ip
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], lease_ip
             );
 
             // Send lease update to GUI
@@ -603,7 +614,7 @@ impl DhcpManager {
         &self,
         packet: &DhcpPacket,
         offer_ip: Ipv4Addr,
-        socket: &UdpSocket
+        socket: &UdpSocket,
     ) -> Result<(), DhcpError> {
         let server_ip = self.server_ip.unwrap();
         let lease_time = self.lease_time.as_secs() as u32;
@@ -613,7 +624,7 @@ impl DhcpManager {
             server_ip,
             offer_ip,
             self.subnet_mask,
-            lease_time
+            lease_time,
         );
 
         let broadcast_addr = SocketAddrV4::new(Ipv4Addr::BROADCAST, 68);
@@ -622,13 +633,7 @@ impl DhcpManager {
         let mac = packet.get_mac();
         info!(
             "Sent DHCP OFFER: {} to {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            offer_ip,
-            mac[0],
-            mac[1],
-            mac[2],
-            mac[3],
-            mac[4],
-            mac[5]
+            offer_ip, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
 
         Ok(())
@@ -639,7 +644,7 @@ impl DhcpManager {
         &self,
         packet: &DhcpPacket,
         ack_ip: Ipv4Addr,
-        socket: &UdpSocket
+        socket: &UdpSocket,
     ) -> Result<(), DhcpError> {
         let server_ip = self.server_ip.unwrap();
         let lease_time = self.lease_time.as_secs() as u32;
@@ -649,7 +654,7 @@ impl DhcpManager {
             server_ip,
             ack_ip,
             self.subnet_mask,
-            lease_time
+            lease_time,
         );
 
         let broadcast_addr = SocketAddrV4::new(Ipv4Addr::BROADCAST, 68);
@@ -658,13 +663,7 @@ impl DhcpManager {
         let mac = packet.get_mac();
         info!(
             "Sent DHCP ACK: {} to {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            ack_ip,
-            mac[0],
-            mac[1],
-            mac[2],
-            mac[3],
-            mac[4],
-            mac[5]
+            ack_ip, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
 
         Ok(())

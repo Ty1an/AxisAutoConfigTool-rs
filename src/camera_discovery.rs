@@ -2,11 +2,11 @@
 //! Camera discovery module
 
 use anyhow::Result;
-use log::{ debug, info };
-use reqwest::{ Client, ClientBuilder, Method };
-use serde::{ Deserialize, Serialize };
+use log::{debug, info};
+use reqwest::{Client, ClientBuilder, Method};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::{ IpAddr, Ipv4Addr, SocketAddr };
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -16,29 +16,26 @@ use url::Url;
 /// Custom error types for camera discovery operations
 #[derive(Error, Debug)]
 pub enum DiscoveryError {
-    #[error("Network timeout for {ip}")] Timeout {
-        ip: String,
-    },
+    #[error("Network timeout for {ip}")]
+    Timeout { ip: String },
 
-    #[error("Connection failed for {ip}: {reason}")] ConnectionFailed {
-        ip: String,
-        reason: String,
-    },
+    #[error("Connection failed for {ip}: {reason}")]
+    ConnectionFailed { ip: String, reason: String },
 
-    #[error("HTTP error for {ip}: {status}")] HttpError {
-        ip: String,
-        status: u16,
-    },
+    #[error("HTTP error for {ip}: {status}")]
+    HttpError { ip: String, status: u16 },
 
-    #[error("Invalid IP address: {ip}")] InvalidIp {
-        ip: String,
-    },
+    #[error("Invalid IP address: {ip}")]
+    InvalidIp { ip: String },
 
-    #[error("Request error: {0}")] Request(#[from] reqwest::Error),
+    #[error("Request error: {0}")]
+    Request(#[from] reqwest::Error),
 
-    #[error("IO error: {0}")] Io(#[from] std::io::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 
-    #[error("URL parse error: {0}")] UrlParse(#[from] url::ParseError),
+    #[error("URL parse error: {0}")]
+    UrlParse(#[from] url::ParseError),
 }
 
 /// Device information returned by discovery operations
@@ -121,13 +118,19 @@ impl CameraDiscovery {
 
         // Try basic HTTP connectivity as a fallback
         if self.check_http_connection(ip).await? {
-            info!("Device at {} has open HTTP port (possibly an Axis camera)", ip_str);
+            info!(
+                "Device at {} has open HTTP port (possibly an Axis camera)",
+                ip_str
+            );
             return Ok(true);
         }
 
         // If device responded to ping but not to HTTP, it's likely not a camera
         if is_pingable {
-            debug!("Device at {} responded to ping but doesn't appear to be an Axis camera", ip_str);
+            debug!(
+                "Device at {} responded to ping but doesn't appear to be an Axis camera",
+                ip_str
+            );
         }
 
         Ok(false)
@@ -138,13 +141,20 @@ impl CameraDiscovery {
         let ip_str = ip.to_string();
 
         // Common Axis endpoints to check
-        let endpoints = ["/axis-cgi/usergroup.cgi", "/axis-cgi/basicdeviceinfo.cgi", "/"];
+        let endpoints = [
+            "/axis-cgi/usergroup.cgi",
+            "/axis-cgi/basicdeviceinfo.cgi",
+            "/",
+        ];
 
         // First try HEAD requests to common Axis endpoints
         for endpoint in &endpoints {
             match self.check_endpoint_with_head(ip, endpoint).await {
                 Ok(true) => {
-                    info!("Axis server characteristics detected at {} via {}", ip_str, endpoint);
+                    info!(
+                        "Axis server characteristics detected at {} via {}",
+                        ip_str, endpoint
+                    );
                     return Ok(true);
                 }
                 Ok(false) => {
@@ -174,7 +184,7 @@ impl CameraDiscovery {
     async fn check_endpoint_with_head(
         &self,
         ip: Ipv4Addr,
-        endpoint: &str
+        endpoint: &str,
     ) -> Result<bool, DiscoveryError> {
         let url_str = format!("http://{}{}", ip, endpoint);
         let url = Url::parse(&url_str)?;
@@ -199,9 +209,8 @@ impl CameraDiscovery {
             if let Some(auth_header) = headers.get("www-authenticate") {
                 if let Ok(auth_str) = auth_header.to_str() {
                     let auth_lower = auth_str.to_lowercase();
-                    if
-                        auth_lower.contains("digest") &&
-                        (auth_lower.contains("axis") || auth_lower.contains("realm"))
+                    if auth_lower.contains("digest")
+                        && (auth_lower.contains("axis") || auth_lower.contains("realm"))
                     {
                         info!("Axis digest authentication detected at {}", ip);
                         return Ok(true);
@@ -230,7 +239,7 @@ impl CameraDiscovery {
     /// Check response content for Axis indicators
     async fn check_content_for_axis_indicators(
         &self,
-        ip: Ipv4Addr
+        ip: Ipv4Addr,
     ) -> Result<bool, DiscoveryError> {
         let url_str = format!("http://{}/", ip);
         let url = Url::parse(&url_str)?;
@@ -254,8 +263,8 @@ impl CameraDiscovery {
     /// Check if a device responds to ping
     async fn check_ping(&self, ip: Ipv4Addr) -> Result<bool, DiscoveryError> {
         // Use the optimized ping function from network_utilities
-        crate::network_utilities
-            ::ping_host(ip, 1, self.timeout).await
+        crate::network_utilities::ping_host(ip, 1, self.timeout)
+            .await
             .map_err(|e| DiscoveryError::ConnectionFailed {
                 ip: ip.to_string(),
                 reason: format!("Ping failed: {}", e),
@@ -312,7 +321,7 @@ impl CameraDiscovery {
         &self,
         ip: Ipv4Addr,
         username: Option<&str>,
-        password: Option<&str>
+        password: Option<&str>,
     ) -> Result<DeviceInfo, DiscoveryError> {
         let ip_str = ip.to_string();
         let start_time = std::time::Instant::now();
@@ -354,7 +363,7 @@ impl CameraDiscovery {
         &self,
         ip: Ipv4Addr,
         username: Option<&str>,
-        password: Option<&str>
+        password: Option<&str>,
     ) -> Result<DeviceInfo, DiscoveryError> {
         let ip_str = ip.to_string();
         let url_str = format!("http://{}/", ip);
@@ -388,8 +397,9 @@ impl CameraDiscovery {
                 }
             });
 
-        let device_type = if
-            server_header.as_ref().is_some_and(|s| s.to_lowercase().contains("axis"))
+        let device_type = if server_header
+            .as_ref()
+            .is_some_and(|s| s.to_lowercase().contains("axis"))
         {
             Some("axis_camera".to_string())
         } else {
@@ -416,10 +426,15 @@ impl CameraDiscovery {
     }
 
     /// Try to get model information from camera using basic device info API
-    async fn try_get_model_info(&self, ip: Ipv4Addr, username: &str, password: &str) -> Option<String> {
+    async fn try_get_model_info(
+        &self,
+        ip: Ipv4Addr,
+        username: &str,
+        password: &str,
+    ) -> Option<String> {
         let base_url = format!("http://{}", ip);
         let endpoint = "/axis-cgi/basicdeviceinfo.cgi";
-        
+
         if let Ok(url) = url::Url::parse(&base_url).and_then(|u| u.join(endpoint)) {
             let json_payload = serde_json::json!({
                 "apiVersion": "1.0",
@@ -427,7 +442,8 @@ impl CameraDiscovery {
                 "method": "getAllProperties"
             });
 
-            if let Ok(response) = self.client
+            if let Ok(response) = self
+                .client
                 .post(url)
                 .json(&json_payload)
                 .basic_auth(username, Some(password))
@@ -437,7 +453,9 @@ impl CameraDiscovery {
             {
                 if response.status().is_success() {
                     if let Ok(response_text) = response.text().await {
-                        if let Ok(json_response) = serde_json::from_str::<serde_json::Value>(&response_text) {
+                        if let Ok(json_response) =
+                            serde_json::from_str::<serde_json::Value>(&response_text)
+                        {
                             // Try to extract model from various possible fields
                             if let Some(data) = json_response.get("data") {
                                 if let Some(property_list) = data.get("propertyList") {
@@ -493,7 +511,7 @@ impl CameraDiscovery {
     pub async fn fast_scan_subnet(
         &self,
         network: &str,
-        max_cameras: Option<usize>
+        max_cameras: Option<usize>,
     ) -> Result<Vec<DeviceInfo>, DiscoveryError> {
         use ipnetwork::Ipv4Network;
 
@@ -511,15 +529,21 @@ impl CameraDiscovery {
 
         let mut handles = Vec::new();
 
-        info!("Fast scanning network: {} (stopping after {} cameras)", network, max_find);
+        info!(
+            "Fast scanning network: {} (stopping after {} cameras)",
+            network, max_find
+        );
 
         for ip in network.iter() {
             // Check if we've found enough cameras
             {
                 let current_devices = devices.read().await;
                 // Early exit when enough cameras found to avoid unnecessary network traffic
-            if current_devices.len() >= max_find {
-                    info!("Found {} cameras, stopping scan early", current_devices.len());
+                if current_devices.len() >= max_find {
+                    info!(
+                        "Found {} cameras, stopping scan early",
+                        current_devices.len()
+                    );
                     break;
                 }
             }
@@ -536,7 +560,11 @@ impl CameraDiscovery {
                     if device_info.status == "discovered" {
                         let mut devices_write = devices_clone.write().await;
                         devices_write.push(device_info);
-                        info!("Found camera at {}, total found: {}", ip, devices_write.len());
+                        info!(
+                            "Found camera at {}, total found: {}",
+                            ip,
+                            devices_write.len()
+                        );
                     }
                 }
             });
@@ -574,9 +602,9 @@ impl CameraDiscovery {
         let start_time = std::time::Instant::now();
 
         // Quick ping check
-        let is_pingable = timeout(Duration::from_secs(1), self.check_ping(ip)).await.unwrap_or(
-            Ok(false)
-        )?;
+        let is_pingable = timeout(Duration::from_secs(1), self.check_ping(ip))
+            .await
+            .unwrap_or(Ok(false))?;
 
         if !is_pingable {
             return Ok(DeviceInfo {
@@ -592,10 +620,9 @@ impl CameraDiscovery {
         }
 
         // Quick port check
-        let port_open = timeout(
-            Duration::from_secs(1),
-            self.check_http_connection(ip)
-        ).await.unwrap_or(Ok(false))?;
+        let port_open = timeout(Duration::from_secs(1), self.check_http_connection(ip))
+            .await
+            .unwrap_or(Ok(false))?;
 
         let response_time = start_time.elapsed().as_millis() as u64;
 

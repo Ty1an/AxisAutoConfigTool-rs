@@ -139,20 +139,6 @@ impl ModelFirmwareMapping {
     pub fn add_firmware(
         &mut self,
         filename: String,
-        data: Arc<Vec<u8>>,
-        compatible_models: Vec<String>
-    ) {
-        self.firmware_files.push(FirmwareFile {
-            filename,
-            file_path: None,
-            data: Some(data),
-            compatible_models,
-        });
-    }
-
-    pub fn add_firmware_path(
-        &mut self,
-        filename: String,
         file_path: std::path::PathBuf,
         compatible_models: Vec<String>
     ) {
@@ -160,6 +146,20 @@ impl ModelFirmwareMapping {
             filename,
             file_path: Some(file_path),
             data: None,
+            compatible_models,
+        });
+    }
+
+    pub fn add_firmware_data(
+        &mut self,
+        filename: String,
+        data: Arc<Vec<u8>>,
+        compatible_models: Vec<String>
+    ) {
+        self.firmware_files.push(FirmwareFile {
+            filename,
+            file_path: None,
+            data: Some(data),
             compatible_models,
         });
     }
@@ -274,6 +274,28 @@ impl CameraOperations {
             retry_delay: Duration::from_secs(2),
             client,
         })
+    }
+    
+    /// Find camera's new IP by MAC address in DHCP leases (much more efficient)
+    pub fn find_camera_ip_by_mac_in_dhcp_leases(
+        mac_address: &str,
+        dhcp_leases: &[crate::dchp_manager::DhcpLease]
+    ) -> Option<Ipv4Addr> {
+        for lease in dhcp_leases {
+            let lease_mac = format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                lease.mac[0], lease.mac[1], lease.mac[2],
+                lease.mac[3], lease.mac[4], lease.mac[5]
+            );
+            
+            if lease_mac.to_lowercase() == mac_address.to_lowercase() {
+                debug!("Found camera MAC {} at IP {} in DHCP leases", mac_address, lease.ip);
+                return Some(lease.ip);
+            }
+        }
+        
+        debug!("Camera MAC {} not found in current DHCP leases", mac_address);
+        None
     }
 
     /// Calculate MD5 hash for digest authentication
@@ -570,6 +592,62 @@ impl CameraOperations {
         unreachable!("Should have returned or errored before this point");
     }
 
+    /// Set final static IP configuration on camera with MAC-based IP tracking
+    pub async fn set_final_static_ip_with_mac_tracking(
+        &self,
+        current_camera_ip: Ipv4Addr,
+        admin_user: &str,
+        admin_pass: &str,
+        ip_config: &IpConfig,
+        protocol: Protocol,
+        camera_mac: &str,
+        dhcp_leases_provider: impl Fn() -> Vec<crate::dchp_manager::DhcpLease>
+    ) -> Result<(String, Option<Ipv4Addr>), CameraError> {
+        // Set the static IP configuration
+        let result = self.set_final_static_ip(
+            current_camera_ip,
+            admin_user, 
+            admin_pass,
+            ip_config,
+            protocol
+        ).await;
+        
+        match result {
+            Ok(message) => {
+                info!("Static IP configuration sent, checking if camera moved to new DHCP IP...");
+                
+                // Wait a moment for the camera to potentially restart and get new DHCP lease
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                
+                // Get the most current DHCP leases and look up camera's new IP by MAC address
+                let current_dhcp_leases = dhcp_leases_provider();
+                if let Some(new_ip) = Self::find_camera_ip_by_mac_in_dhcp_leases(camera_mac, &current_dhcp_leases) {
+                    if new_ip != current_camera_ip {
+                        info!("Camera with MAC {} moved from {} to new DHCP IP: {}", camera_mac, current_camera_ip, new_ip);
+                        
+                        // Quickly verify the camera is accessible at the new IP
+                        match self.verify_admin_credentials(new_ip, admin_user, admin_pass, protocol).await {
+                            Ok(_) => {
+                                info!("Verified camera is accessible at new IP: {}", new_ip);
+                                return Ok((message, Some(new_ip)));
+                            }
+                            Err(e) => {
+                                warn!("Camera found in DHCP at {} but not accessible: {}", new_ip, e);
+                            }
+                        }
+                    } else {
+                        debug!("Camera MAC {} still at same IP: {}", camera_mac, current_camera_ip);
+                    }
+                } else {
+                    debug!("Camera MAC {} not found in current DHCP leases after configuration", camera_mac);
+                }
+                
+                Ok((message, None))
+            }
+            Err(e) => Err(e)
+        }
+    }
+    
     /// Set final static IP configuration on camera
     pub async fn set_final_static_ip(
         &self,
@@ -746,7 +824,8 @@ impl CameraOperations {
         let url = Url::parse(&base_url)?.join(endpoint)?;
 
         for attempt in 1..=self.retry_count {
-            info!("Uploading firmware to {} (Attempt {}/{})", ip_str, attempt, self.retry_count);
+            let upload_start = std::time::Instant::now();
+            info!("🚀 Starting firmware upload to {} (Attempt {}/{}, {} bytes)", ip_str, attempt, self.retry_count, firmware_data.len());
 
             let json_part = multipart::Part
                 ::text(json_payload_str.clone())
@@ -806,8 +885,9 @@ impl CameraOperations {
             let status_code = status.as_u16();
 
             if status.is_success() {
+                let upload_duration = upload_start.elapsed();
                 let response_text = response.text().await.map_err(CameraError::Request)?;
-                info!("Firmware upload response (HTTP {}): {}", status_code, response_text);
+                info!("📤 Firmware upload completed in {:.1}s (HTTP {}): {}", upload_duration.as_secs_f32(), status_code, response_text);
 
                 match serde_json::from_str::<Value>(&response_text) {
                     Ok(json_response) => {
@@ -847,16 +927,16 @@ impl CameraOperations {
                         };
 
                         info!("Camera will reboot now. Waiting for it to come back online...");
-                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        tokio::time::sleep(Duration::from_secs(5)).await;
 
                         match
-                            super::network_utilities::wait_for_camera_online(
+                            crate::network_utilities::wait_for_camera_online(
                                 ip,
                                 admin_user,
                                 admin_pass,
-                                super::network_utilities::Protocol::Http,
-                                Duration::from_secs(90), // Reduced to 1.5 minutes to match actual firmware completion time
-                                Duration::from_secs(2) // Check every 2 seconds for more responsive detection
+                                crate::network_utilities::Protocol::Http,
+                                Duration::from_secs(100), // Increased to 3 minutes for firmware completion
+                                Duration::from_millis(500) // Check every 500ms for much more responsive detection
                             ).await
                         {
                             Ok((true, elapsed_time)) => {
@@ -870,7 +950,7 @@ impl CameraOperations {
                                 warn!("Camera at {} authentication timeout, but checking basic connectivity...", ip_str);
 
                                 if
-                                    let Ok(true) = super::network_utilities::ping_host(
+                                    let Ok(true) = crate::network_utilities::ping_host(
                                         ip,
                                         1,
                                         Duration::from_secs(3)
@@ -890,7 +970,7 @@ impl CameraOperations {
                                     e
                                 );
                                 if
-                                    let Ok(true) = super::network_utilities::ping_host(
+                                    let Ok(true) = crate::network_utilities::ping_host(
                                         ip,
                                         1,
                                         Duration::from_secs(3)
@@ -1149,8 +1229,8 @@ impl CameraOperations {
         request.send().await.map_err(CameraError::Request)
     }
 
-    /// Verify admin credentials work
-    async fn verify_admin_credentials(
+    /// Verify admin credentials work (made public for IP scanning)
+    pub async fn verify_admin_credentials(
         &self,
         ip: Ipv4Addr,
         username: &str,
@@ -1164,6 +1244,7 @@ impl CameraOperations {
         let response = self.client
             .get(url)
             .basic_auth(username, Some(password))
+            .timeout(Duration::from_secs(3)) // Shorter timeout for scanning
             .send().await
             .map_err(CameraError::Request)?;
 

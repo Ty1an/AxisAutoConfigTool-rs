@@ -1,32 +1,95 @@
 #![windows_subsystem = "windows"]
 
-mod dchp_manager;
-mod network_utilities;
 mod camera_discovery;
 mod camera_operations;
 mod csv_handler;
+mod dchp_manager;
+mod network_utilities;
 
 use anyhow::Result;
 use chrono::Utc;
 use eframe::egui::TextStyle;
+use futures::future::join_all;
 use log::{ error, info };
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{ mpsc, Mutex, Semaphore };
 use tokio::time::Instant;
-use futures::future::join_all;
+
+// String constants to reduce allocations
+const ROOT_USERNAME: &str = "root";
+const TOOL_VERSION: &str = "1.0.0";
+const PROCESSING_STATUS: &str = "Processing";
+const FAILED_INIT_STATUS: &str = "Failed - Init";
+const FAILED_INVALID_IP_STATUS: &str = "Failed - Invalid IP";
+const SUCCESS_STATUS: &str = "Success";
+const FAILED_STATUS: &str = "Failed";
 
 use camera_discovery::{ CameraDiscovery, DeviceInfo };
 use camera_operations::{ CameraOperations, IpConfig, ModelFirmwareMapping };
-use csv_handler::{ CsvHandler, CameraInventoryData, OperationResult, OperationResults };
-use dchp_manager::{ DhcpManager, DhcpLease, NetworkInterface };
+use csv_handler::{ CameraInventoryData, CsvHandler, OperationResult, OperationResults };
+use dchp_manager::{ DhcpLease, DhcpManager, NetworkInterface };
 
 #[derive(Clone, Debug)]
 struct FirmwareEntry {
     file_path: Option<PathBuf>,
     compatible_models: String, // Comma-separated list of compatible models
     is_loaded: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ResponsiveDimensions {
+    side_panel_width: f32,
+    card_min_height: f32,
+    button_height: f32,
+    text_field_height: f32,
+    base_spacing: f32,
+    font_scale: f32,
+}
+
+// Shared configuration data to avoid excessive cloning
+#[derive(Clone)]
+struct ConfigData {
+    admin_password: String,
+    camera_subnet_mask: String,
+    camera_gateway: String,
+    firmware_mapping: ModelFirmwareMapping,
+    target_ips: Arc<Vec<String>>,
+}
+
+// Structure to track camera by MAC address for IP change handling
+#[derive(Clone, Debug)]
+struct CameraTracker {
+    pub mac_address: String,
+    pub current_ip: String,
+    pub target_ip: String,
+    pub last_seen: std::time::Instant,
+}
+
+// Consolidated channel management to reduce Option overhead
+struct ChannelManager {
+    discovery_rx: Option<mpsc::UnboundedReceiver<Vec<DeviceInfo>>>,
+    discovery_complete_rx: Option<mpsc::UnboundedReceiver<bool>>,
+    processing_log_rx: Option<mpsc::UnboundedReceiver<String>>,
+    processing_result_rx: Option<mpsc::UnboundedReceiver<CameraInventoryData>>,
+    processing_complete_rx: Option<mpsc::UnboundedReceiver<bool>>,
+    lease_refresh_rx: Option<mpsc::UnboundedReceiver<Vec<DhcpLease>>>,
+    lease_update_tx: Option<mpsc::UnboundedSender<Vec<DhcpLease>>>,
+}
+
+impl Default for ChannelManager {
+    fn default() -> Self {
+        Self {
+            discovery_rx: None,
+            discovery_complete_rx: None,
+            processing_log_rx: None,
+            processing_result_rx: None,
+            processing_complete_rx: None,
+            lease_refresh_rx: None,
+            lease_update_tx: None,
+        }
+    }
 }
 
 pub struct AxisCameraApp {
@@ -54,19 +117,12 @@ pub struct AxisCameraApp {
     rt: Option<tokio::runtime::Runtime>,
     dhcp_shutdown_tx: Option<mpsc::Sender<()>>,
 
-    discovery_rx: Option<mpsc::UnboundedReceiver<Vec<DeviceInfo>>>,
-    discovery_complete_rx: Option<mpsc::UnboundedReceiver<bool>>,
-
-    processing_log_rx: Option<mpsc::UnboundedReceiver<String>>,
-    processing_result_rx: Option<mpsc::UnboundedReceiver<CameraInventoryData>>,
-    processing_complete_rx: Option<mpsc::UnboundedReceiver<bool>>,
-
-    lease_refresh_rx: Option<mpsc::UnboundedReceiver<Vec<DhcpLease>>>,
-    lease_update_tx: Option<mpsc::UnboundedSender<Vec<DhcpLease>>>,
+    // Consolidated channel management
+    channels: Option<ChannelManager>,
 
     camera_subnet_mask: String,
     camera_gateway: String,
-    
+
     // CSV import functionality
     csv_import_file_path: String,
     imported_csv_data: Vec<CameraInventoryData>,
@@ -87,30 +143,24 @@ impl Default for AxisCameraApp {
             dhcp_interfaces: Vec::new(),
             selected_interface: None,
             dhcp_running: false,
-            dhcp_leases: Vec::new(),
-            discovered_cameras: Vec::new(),
+            dhcp_leases: Vec::with_capacity(100),
+            discovered_cameras: Vec::with_capacity(50),
             discovery_in_progress: false,
             last_scan_time: None,
             admin_password: String::new(),
             ip_range_input: String::new(),
             firmware_mapping: ModelFirmwareMapping::new(),
-            firmware_entries: Vec::new(),
+            firmware_entries: Vec::with_capacity(10),
             processing_in_progress: false,
-            processing_logs: Vec::new(),
-            processing_results: Vec::new(),
+            processing_logs: Vec::with_capacity(200),
+            processing_results: Vec::with_capacity(75),
             rt: None,
             dhcp_shutdown_tx: None,
-            discovery_rx: None,
-            discovery_complete_rx: None,
-            processing_log_rx: None,
-            processing_result_rx: None,
-            processing_complete_rx: None,
-            lease_refresh_rx: None,
-            lease_update_tx: None,
+            channels: Some(ChannelManager::default()),
             camera_subnet_mask: "255.255.255.0".to_string(),
             camera_gateway: "192.168.1.1".to_string(),
             csv_import_file_path: String::new(),
-            imported_csv_data: Vec::new(),
+            imported_csv_data: Vec::with_capacity(1000),
         }
     }
 }
@@ -119,59 +169,134 @@ impl AxisCameraApp {
     fn create_button(text: &str, size: egui::Vec2) -> egui::Button {
         egui::Button::new(text).min_size(size)
     }
+    
+    // Responsive design helper functions
+    fn get_responsive_dimensions(ui: &egui::Ui) -> ResponsiveDimensions {
+        let available_width = ui.available_width();
+        let available_height = ui.available_height();
+        
+        ResponsiveDimensions {
+            side_panel_width: (available_width * 0.25).max(280.0).min(400.0),
+            card_min_height: (available_height * 0.35).max(280.0),
+            button_height: (available_height * 0.04).max(28.0).min(40.0),
+            text_field_height: (available_height * 0.025).max(18.0).min(24.0),
+            base_spacing: (available_width * 0.008).max(6.0).min(12.0),
+            font_scale: Self::calculate_font_scale(available_width, available_height),
+        }
+    }
+    
+    fn calculate_font_scale(width: f32, height: f32) -> f32 {
+        let base_area = 1400.0 * 900.0; // Original design area
+        let current_area = width * height;
+        (current_area / base_area).sqrt().clamp(0.8, 1.4)
+    }
+
+    fn toggle_switch(ui: &mut egui::Ui, on: &mut bool, size: egui::Vec2) -> egui::Response {
+        let desired_size = size;
+        let (rect, mut response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+
+        if response.clicked() {
+            *on = !*on;
+            response.mark_changed();
+        }
+
+        if ui.is_rect_visible(rect) {
+            let how_on = ui.ctx().animate_bool(response.id, *on);
+            let visuals = ui.style().interact_selectable(&response, *on);
+            let rect = rect.expand(visuals.expansion);
+            let radius = 0.5 * rect.height();
+
+            // Background with colors matching the Nordic UI theme
+            let bg_color = if *on {
+                egui::Color32::from_rgb(163, 190, 140) // NORD_GREEN to match the rest of the UI
+            } else {
+                egui::Color32::from_rgb(76, 86, 106) // NORD_POLAR_NIGHT[3] to match inactive elements
+            };
+
+            // Draw rounded rectangle background
+            ui.painter().rect_filled(rect, egui::Rounding::same(radius as u8), bg_color);
+
+            // Calculate circle position with smooth animation
+            let circle_radius = radius - 3.0; // Slightly smaller for better iOS look
+            let circle_x = egui::lerp(
+                rect.min.x + circle_radius + 2.0..=rect.max.x - circle_radius - 2.0,
+                how_on
+            );
+            let circle_center = egui::pos2(circle_x, rect.center().y);
+
+            // Draw white circle with subtle shadow
+            ui.painter().circle(
+                circle_center + egui::vec2(0.5, 0.5),
+                circle_radius,
+                egui::Color32::from_rgba_premultiplied(0, 0, 0, 20), // Shadow
+                egui::Stroke::NONE
+            );
+            ui.painter().circle(
+                circle_center,
+                circle_radius,
+                egui::Color32::WHITE,
+                egui::Stroke::new(0.5, egui::Color32::from_gray(200))
+            );
+        }
+
+        response
+    }
 
     fn load_firmware_files(&mut self) {
         self.firmware_mapping = ModelFirmwareMapping::new();
 
         for entry in &mut self.firmware_entries {
             if let Some(path) = &entry.file_path {
-                match std::fs::read(path) {
-                    Ok(_data) => {
-                        let filename = path.file_name().unwrap().to_string_lossy().to_string();
+                if path.exists() {
+                    let filename = path.file_name().unwrap().to_string_lossy().to_string();
 
-                        let compatible_models: Vec<String> = if
-                            !entry.compatible_models.trim().is_empty()
-                        {
-                            entry.compatible_models
-                                .split(',')
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty())
-                                .collect()
-                        } else {
-                            if
+                    // Load firmware data immediately into memory for fast access
+                    match std::fs::read(path) {
+                        Ok(firmware_data) => {
+
+                            let compatible_models: Vec<String> = if
+                                !entry.compatible_models.trim().is_empty()
+                            {
+                                entry.compatible_models
+                                    .split(',')
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .collect()
+                            } else if
                                 let Some(extracted_model) =
-                                    ModelFirmwareMapping::extract_model_from_firmware_filename(
-                                        &filename
-                                    )
+                                    ModelFirmwareMapping::extract_model_from_firmware_filename(&filename)
                             {
                                 vec![extracted_model]
                             } else {
                                 vec!["auto-detect".to_string()]
-                            }
-                        };
+                            };
 
-                        if !compatible_models.is_empty() {
-                            self.firmware_mapping.add_firmware_path(
-                                filename.clone(),
-                                path.clone(),
-                                compatible_models.clone()
-                            );
-                            entry.is_loaded = true;
+                            if !compatible_models.is_empty() {
+                                // Add firmware with pre-loaded data for immediate use
+                                self.firmware_mapping.add_firmware_data(
+                                    filename.clone(),
+                                    std::sync::Arc::new(firmware_data),
+                                    compatible_models.clone()
+                                );
+                                entry.is_loaded = true;
 
-                            if
-                                entry.compatible_models.trim().is_empty() &&
-                                compatible_models.len() == 1 &&
-                                compatible_models[0] != "auto-detect"
-                            {
-                                entry.compatible_models = compatible_models[0].clone();
+                                if
+                                    entry.compatible_models.trim().is_empty() &&
+                                    compatible_models.len() == 1 &&
+                                    compatible_models[0] != "auto-detect"
+                                {
+                                    entry.compatible_models = compatible_models[0].clone();
+                                }
+                            } else {
+                                entry.is_loaded = false;
                             }
-                        } else {
+                        }
+                        Err(_) => {
                             entry.is_loaded = false;
                         }
                     }
-                    Err(_) => {
-                        entry.is_loaded = false;
-                    }
+                } else {
+                    entry.is_loaded = false;
                 }
             }
         }
@@ -185,9 +310,10 @@ impl AxisCameraApp {
 
         let csv_handler = CsvHandler::new();
         let path = std::path::Path::new(&self.csv_import_file_path);
-        
+
         // Determine file type by extension
-        let is_excel = path.extension()
+        let is_excel = path
+            .extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_lowercase() == "xlsx")
             .unwrap_or(false);
@@ -202,7 +328,11 @@ impl AxisCameraApp {
             Ok(data) => {
                 self.imported_csv_data = data;
                 let file_type = if is_excel { "Excel" } else { "CSV" };
-                info!("Successfully loaded {} entries from {} file", self.imported_csv_data.len(), file_type);
+                info!(
+                    "Successfully loaded {} entries from {} file",
+                    self.imported_csv_data.len(),
+                    file_type
+                );
             }
             Err(e) => {
                 error!("Failed to load file: {}", e);
@@ -429,7 +559,7 @@ impl AxisCameraApp {
 
         visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.5, NORD_POLAR_NIGHT[3]);
 
-        style.spacing.button_padding = egui::vec2(12.0, 8.0);
+        style.spacing.button_padding = egui::vec2(8.0, 6.0);
         style.spacing.menu_margin = egui::Margin::same(8);
         style.spacing.indent = 16.0;
         style.spacing.item_spacing = egui::vec2(8.0, 4.0);
@@ -449,7 +579,7 @@ impl AxisCameraApp {
         );
         style.text_styles.insert(
             TextStyle::Button,
-            egui::FontId::new(16.0, egui::FontFamily::Proportional)
+            egui::FontId::new(15.0, egui::FontFamily::Proportional)
         );
         style.text_styles.insert(
             TextStyle::Monospace,
@@ -457,7 +587,11 @@ impl AxisCameraApp {
         );
         style.text_styles.insert(
             TextStyle::Small,
-            egui::FontId::new(13.0, egui::FontFamily::Proportional)
+            egui::FontId::new(11.0, egui::FontFamily::Proportional)
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Name("ExtraSmall".into()),
+            egui::FontId::new(15.0, egui::FontFamily::Proportional)
         );
 
         visuals.window_fill = visuals.window_fill.gamma_multiply(0.95);
@@ -473,17 +607,17 @@ impl AxisCameraApp {
     fn show_unified_layout(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::SidePanel
             ::left("control_panel")
-            .default_width(240.0)
-            .min_width(220.0)
-            .max_width(280.0)
-            .resizable(true)
+            .exact_width(300.0)
+            .resizable(false)
             .show_inside(ui, |ui| {
                 self.show_compact_control_panel(ui, ctx);
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
+            let card_spacing = 8.0;
+
             ui.horizontal(|ui| {
-                let half_width = ui.available_width() / 2.0 - 2.0;
+                let half_width = (ui.available_width() - card_spacing) / 2.0;
 
                 ui.vertical(|ui| {
                     ui.set_min_width(half_width);
@@ -493,7 +627,7 @@ impl AxisCameraApp {
                     self.show_discovery_card(ui);
                 });
 
-                ui.add_space(4.0);
+                ui.add_space(card_spacing);
 
                 ui.vertical(|ui| {
                     ui.set_min_width(half_width);
@@ -504,7 +638,7 @@ impl AxisCameraApp {
                 });
             });
 
-            ui.add_space(4.0);
+            ui.add_space(card_spacing);
 
             ui.vertical(|ui| {
                 let remaining_height = ui.available_height() - 8.0;
@@ -518,6 +652,8 @@ impl AxisCameraApp {
     fn show_compact_control_panel(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
         const NORD_GREEN: egui::Color32 = egui::Color32::from_rgb(163, 190, 140);
         const NORD_RED: egui::Color32 = egui::Color32::from_rgb(191, 97, 106);
+        
+        let dimensions = Self::get_responsive_dimensions(ui);
 
         egui::ScrollArea
             ::vertical()
@@ -527,20 +663,25 @@ impl AxisCameraApp {
                 ui.set_width(ui.available_width());
 
                 ui.vertical_centered(|ui| {
-                    ui.add_space(2.0);
-                    ui.strong("📷 Axis Auto Config");
-                    ui.add_space(2.0);
+                    ui.add_space(1.0);
+                    ui.label(
+                        egui::RichText
+                            ::new("Axis Auto Config")
+                            .text_style(egui::TextStyle::Heading)
+                            .size(20.0)
+                    );
+                    ui.add_space(1.0);
                 });
 
                 ui.separator();
-                ui.add_space(4.0);
+                ui.add_space(3.0);
 
                 ui.horizontal(|ui| {
-                    ui.label("Interface:");
-                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Interface:").size(14.0));
+                    ui.add_space(2.0);
                     egui::ComboBox
                         ::from_label("")
-                        .width(120.0)
+                        .width(110.0)
                         .selected_text(
                             self.selected_interface
                                 .and_then(|i| self.dhcp_interfaces.get(i))
@@ -555,123 +696,79 @@ impl AxisCameraApp {
                         });
                 });
 
-                ui.add_space(2.0);
+                ui.add_space(1.0);
 
                 ui.horizontal(|ui| {
-                    ui.label("Start DHCP:");
-                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("Start DHCP:").size(14.0));
+                    ui.add_space(2.0);
 
                     let mut dhcp_enabled = self.dhcp_running;
-                    let toggle_response = ui.allocate_response(
-                        egui::Vec2::new(40.0, 20.0),
-                        egui::Sense::click()
-                    );
-
-                    if toggle_response.clicked() {
-                        dhcp_enabled = !dhcp_enabled;
-                        if dhcp_enabled && !self.dhcp_running {
+                    if Self::toggle_switch(ui, &mut dhcp_enabled, egui::vec2(40.0, 20.0)).changed() {
+                        if dhcp_enabled {
                             self.start_dhcp_server();
-                        } else if !dhcp_enabled && self.dhcp_running {
+                        } else {
                             self.stop_dhcp_server();
                         }
                     }
-
-                    let rect = toggle_response.rect;
-                    let how_on = ui
-                        .ctx()
-                        .animate_bool(toggle_response.id.with("toggle"), self.dhcp_running);
-                    let visuals = ui
-                        .style()
-                        .interact_selectable(&toggle_response, self.dhcp_running);
-                    let rect = rect.expand(visuals.expansion);
-                    let radius = 0.5 * rect.height();
-                    ui.painter().rect_filled(rect, radius, visuals.bg_fill);
-                    let circle_x = egui::lerp(rect.left() + radius..=rect.right() - radius, how_on);
-                    let center = egui::pos2(circle_x, rect.center().y);
-                    let circle_color = if self.dhcp_running {
-                        NORD_GREEN
-                    } else {
-                        ui.visuals().weak_text_color()
-                    };
-                    ui.painter().circle_filled(center, 0.75 * radius, circle_color);
-
-                    ui.add_space(8.0);
-                    if self.dhcp_running {
-                        ui.colored_label(NORD_GREEN, "ON");
-                    } else {
-                        ui.colored_label(ui.visuals().weak_text_color(), "OFF");
-                    }
                 });
 
-                ui.add_space(6.0);
-                ui.separator();
                 ui.add_space(4.0);
-
-                ui.strong("Configuration");
-                ui.add_space(2.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("IP Range:");
-                    ui.add_space(4.0);
-                    ui.add_sized(
-                        [120.0, 20.0],
-                        egui::TextEdit
-                            ::singleline(&mut self.ip_range_input)
-                            .hint_text("192.168.5.2-10")
-                    );
-                });
-
-                ui.add_space(2.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Password:");
-                    ui.add_space(4.0);
-                    ui.add_sized(
-                        [120.0, 20.0],
-                        egui::TextEdit
-                            ::singleline(&mut self.admin_password)
-                            .password(true)
-                            .hint_text("admin")
-                    );
-                });
-
-                ui.add_space(2.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Subnet:");
-                    ui.add_space(4.0);
-                    ui.add_sized(
-                        [120.0, 20.0],
-                        egui::TextEdit
-                            ::singleline(&mut self.camera_subnet_mask)
-                            .hint_text("255.255.255.0")
-                    );
-                });
-
-                ui.add_space(2.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Gateway:");
-                    ui.add_space(4.0);
-                    ui.add_sized(
-                        [120.0, 20.0],
-                        egui::TextEdit
-                            ::singleline(&mut self.camera_gateway)
-                            .hint_text("192.168.1.1")
-                    );
-                });
-
-                ui.add_space(6.0);
                 ui.separator();
-                ui.add_space(4.0);
+                ui.add_space(3.0);
 
-                ui.strong("Firmware (Optional)");
-                ui.add_space(2.0);
+                ui.label(egui::RichText::new("Configuration").size(15.0).strong());
+                ui.add_space(1.0);
+
+                ui.label(egui::RichText::new("IP Range:").size(15.0));
+                ui.add_sized(
+                    [ui.available_width(), 20.0],
+                    egui::TextEdit
+                        ::singleline(&mut self.ip_range_input)
+                        .font(egui::TextStyle::Name("ExtraSmall".into()))
+                );
+
+                ui.add_space(1.0);
+
+                ui.label(egui::RichText::new("Subnet:").size(15.0));
+                ui.add_sized(
+                    [ui.available_width(), 20.0],
+                    egui::TextEdit
+                        ::singleline(&mut self.camera_subnet_mask)
+                        .font(egui::TextStyle::Name("ExtraSmall".into()))
+                );
+
+                ui.add_space(1.0);
+
+                ui.label(egui::RichText::new("Gateway:").size(15.0));
+                ui.add_sized(
+                    [ui.available_width(), 20.0],
+                    egui::TextEdit
+                        ::singleline(&mut self.camera_gateway)
+                        .font(egui::TextStyle::Name("ExtraSmall".into()))
+                );
+
+                ui.add_space(1.0);
+
+                ui.label(egui::RichText::new("Password:").size(15.0));
+                ui.add_sized(
+                    [ui.available_width(), 20.0],
+                    egui::TextEdit
+                        ::singleline(&mut self.admin_password)
+                        .password(true)
+                        .font(egui::TextStyle::Name("ExtraSmall".into()))
+                );
+
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(3.0);
+
+                ui.label(egui::RichText::new("Firmware").size(15.0).strong());
+                ui.add_space(1.0);
 
                 if self.firmware_entries.is_empty() {
                     ui.horizontal(|ui| {
                         ui.label("No firmware files");
-                        if ui.small_button("📁 Add").clicked() {
+                        if ui.small_button("➕").clicked() {
                             self.firmware_entries.push(FirmwareEntry {
                                 file_path: None,
                                 compatible_models: String::new(),
@@ -684,51 +781,48 @@ impl AxisCameraApp {
                     let mut file_dialog_for_index = None;
                     let mut remove_index = None;
 
-                    for (i, entry) in self.firmware_entries.iter_mut().enumerate() {
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                if let Some(path) = &entry.file_path {
-                                    ui.label(
-                                        path
-                                            .file_name()
-                                            .unwrap()
-                                            .to_string_lossy()
-                                            .chars()
-                                            .take(15)
-                                            .collect::<String>()
-                                    );
-                                    if entry.is_loaded {
-                                        ui.colored_label(NORD_GREEN, "✓");
-                                    } else {
-                                        ui.colored_label(NORD_RED, "✗");
-                                    }
-                                } else {
-                                    ui.label("No file");
-                                }
+                    egui::ScrollArea
+                        ::vertical()
+                        .id_salt("firmware_files_scroll")
+                        .auto_shrink([false; 2])
+                        .max_height(120.0) // Show about 3 entries then scroll
+                        .show(ui, |ui| {
+                            for (i, entry) in self.firmware_entries.iter_mut().enumerate() {
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        if let Some(path) = &entry.file_path {
+                                            ui.label(
+                                                path
+                                                    .file_name()
+                                                    .unwrap()
+                                                    .to_string_lossy()
+                                                    .chars()
+                                                    .take(15)
+                                                    .collect::<String>()
+                                            );
+                                            if entry.is_loaded {
+                                                ui.colored_label(NORD_GREEN, "✅");
+                                            } else {
+                                                ui.colored_label(NORD_RED, "❌");
+                                            }
+                                        } else {
+                                            ui.label("No file");
+                                        }
 
-                                if ui.small_button("📁").clicked() {
-                                    file_dialog_for_index = Some(i);
-                                }
-                                
-                                if ui.small_button("🗑").clicked() {
-                                    remove_index = Some(i);
-                                }
-                            });
-                            
-                            ui.horizontal(|ui| {
-                                ui.label("Models:");
-                                ui.add_sized(
-                                    [120.0, 20.0],
-                                    egui::TextEdit::singleline(&mut entry.compatible_models)
-                                        .hint_text("P3219,M3206 or auto-detect")
-                                );
-                                if ui.small_button("↻").clicked() {
-                                    should_reload = true;
-                                }
-                            });
+                                        if ui.small_button("🔍").clicked() {
+                                            file_dialog_for_index = Some(i);
+                                        }
+
+                                        if ui.small_button("➖").clicked() {
+                                            remove_index = Some(i);
+                                        }
+                                    });
+
+                                    ui.add_space(2.0);
+                                });
+                            }
                         });
-                    }
-                    
+
                     // Handle removal
                     if let Some(index) = remove_index {
                         self.firmware_entries.remove(index);
@@ -743,9 +837,45 @@ impl AxisCameraApp {
                                 .pick_file()
                         {
                             if let Some(entry) = self.firmware_entries.get_mut(i) {
-                                entry.file_path = Some(path);
-                                entry.is_loaded = false;
-                                should_reload = true;
+                                // Load firmware immediately when selected
+                                let filename = path.file_name().unwrap().to_string_lossy().to_string();
+                                
+                                match std::fs::read(&path) {
+                                    Ok(firmware_data) => {
+
+                                        // Determine compatible models
+                                        let compatible_models: Vec<String> = if
+                                            let Some(extracted_model) =
+                                                ModelFirmwareMapping::extract_model_from_firmware_filename(&filename)
+                                        {
+                                            vec![extracted_model.clone()]
+                                        } else {
+                                            vec!["auto-detect".to_string()]
+                                        };
+
+                                        // Add to firmware mapping immediately
+                                        self.firmware_mapping.add_firmware_data(
+                                            filename.clone(),
+                                            std::sync::Arc::new(firmware_data),
+                                            compatible_models.clone()
+                                        );
+
+                                        // Update entry
+                                        entry.file_path = Some(path);
+                                        entry.is_loaded = true;
+                                        
+                                        // Auto-populate compatible models if empty
+                                        if entry.compatible_models.trim().is_empty() && 
+                                           compatible_models.len() == 1 && 
+                                           compatible_models[0] != "auto-detect" {
+                                            entry.compatible_models = compatible_models[0].clone();
+                                        }
+                                    }
+                                    Err(_) => {
+                                        entry.file_path = Some(path);
+                                        entry.is_loaded = false;
+                                    }
+                                }
                             }
                         }
                     }
@@ -753,9 +883,9 @@ impl AxisCameraApp {
                     if should_reload {
                         self.load_firmware_files();
                     }
-                    
+
                     ui.add_space(4.0);
-                    if ui.button("➕ Add Firmware").clicked() {
+                    if ui.button("Add Firmware").clicked() {
                         self.firmware_entries.push(FirmwareEntry {
                             file_path: None,
                             compatible_models: String::new(),
@@ -764,43 +894,45 @@ impl AxisCameraApp {
                     }
                 }
 
-                ui.add_space(6.0);
-                ui.separator();
                 ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(3.0);
 
                 // File Import Section
-                ui.strong("File Import (Optional)");
-                ui.add_space(2.0);
-                ui.label("Upload an existing Excel (.xlsx) or CSV file to merge with new configuration results:");
-                
+                ui.label(egui::RichText::new("CSV/Excel Import").size(15.0).strong());
+                ui.add_space(1.0);
+
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label("File:");
-                        ui.add_space(4.0);
-                        let available_width = ui.available_width() - 80.0; // Reserve space for Browse button
+                        ui.label(egui::RichText::new("File:").size(15.0));
+                        ui.add_space(2.0);
+                        let available_width = ui.available_width() - 50.0; // Reserve space for Browse button
                         ui.add_sized(
-                            [available_width.max(150.0), 20.0],
-                            egui::TextEdit::singleline(&mut self.csv_import_file_path)
-                                .hint_text("Select Excel or CSV file...")
+                            [available_width.max(130.0), 20.0],
+                            egui::TextEdit
+                                ::singleline(&mut self.csv_import_file_path)
+                                .font(egui::TextStyle::Name("ExtraSmall".into()))
                         );
                     });
-                    ui.add_space(2.0);
+                    ui.add_space(1.0);
                     ui.horizontal(|ui| {
-                        if ui.button("📁 Browse").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Excel files", &["xlsx"])
-                                .add_filter("CSV files", &["csv"])
-                                .add_filter("All supported", &["xlsx", "csv"])
-                                .pick_file()
+                        if ui.button("🔍").clicked() {
+                            if
+                                let Some(path) = rfd::FileDialog
+                                    ::new()
+                                    .add_filter("Excel files", &["xlsx"])
+                                    .add_filter("CSV files", &["csv"])
+                                    .add_filter("All supported", &["xlsx", "csv"])
+                                    .pick_file()
                             {
                                 self.csv_import_file_path = path.to_string_lossy().to_string();
                                 self.load_csv_file();
                             }
                         }
-                        
+
                         if !self.csv_import_file_path.is_empty() {
-                            ui.add_space(4.0);
-                            if ui.button("📤 Load File").clicked() {
+                            ui.add_space(2.0);
+                            if ui.button("Load").clicked() {
                                 self.load_csv_file();
                             }
                         }
@@ -808,17 +940,20 @@ impl AxisCameraApp {
                 });
 
                 if !self.imported_csv_data.is_empty() {
-                    ui.add_space(2.0);
+                    ui.add_space(1.0);
                     ui.colored_label(
                         egui::Color32::from_rgb(46, 204, 113),
-                        format!("✅ Loaded {} entries from CSV", self.imported_csv_data.len())
+                        format!("Loaded {} entries", self.imported_csv_data.len())
                     );
-                    ui.label("New configuration results will be merged with this data.");
                 }
 
-                ui.add_space(6.0);
-                ui.separator();
                 ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(3.0);
+
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(3.0);
 
                 let passwords_valid = !self.admin_password.is_empty();
                 let network_valid =
@@ -836,8 +971,8 @@ impl AxisCameraApp {
                         .add_enabled(
                             can_start,
                             Self::create_button(
-                                "🚀 Start Configuration",
-                                egui::vec2(ui.available_width() - 16.0, 32.0)
+                                "Start Configuration",
+                                egui::vec2(ui.available_width() - dimensions.base_spacing * 2.0, dimensions.button_height)
                             )
                         )
                         .clicked()
@@ -849,13 +984,13 @@ impl AxisCameraApp {
                 if !can_start {
                     ui.add_space(2.0);
                     if !self.dhcp_running {
-                        ui.colored_label(NORD_RED, "❌ Start DHCP first");
+                        ui.colored_label(NORD_RED, "Start DHCP first");
                     } else if !passwords_valid {
-                        ui.colored_label(NORD_RED, "❌ Enter password");
+                        ui.colored_label(NORD_RED, "Enter password");
                     } else if !network_valid {
-                        ui.colored_label(NORD_RED, "❌ Configure network");
+                        ui.colored_label(NORD_RED, "Configure network");
                     } else if !ip_range_valid {
-                        ui.colored_label(NORD_RED, "❌ Enter IP range");
+                        ui.colored_label(NORD_RED, "Enter IP range");
                     }
                 }
             });
@@ -874,8 +1009,8 @@ impl AxisCameraApp {
             .fill(card_color)
             .stroke(egui::Stroke::new(1.0, ui.visuals().window_stroke.color))
             .corner_radius(egui::CornerRadius::same(8))
-            .inner_margin(egui::Margin::same(20))
-            .outer_margin(egui::Margin::same(6))
+            .inner_margin(egui::Margin::same(16)) // Reduced from 20 to 16 for more compact layout
+            .outer_margin(egui::Margin::same(4)) // Reduced from 6 to 4 for uniform spacing
             .shadow(egui::epaint::Shadow {
                 offset: [0, 2],
                 blur: 6,
@@ -897,7 +1032,7 @@ impl AxisCameraApp {
         const NORD_GREEN: egui::Color32 = egui::Color32::from_rgb(163, 190, 140);
         const NORD_RED: egui::Color32 = egui::Color32::from_rgb(191, 97, 106);
 
-        Self::create_highlighted_card_frame(ui, "📡 Discovery", |ui| {
+        Self::create_highlighted_card_frame(ui, "Discovery", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Status:");
                 if self.discovery_in_progress {
@@ -908,9 +1043,9 @@ impl AxisCameraApp {
                 } else {
                     ui.label("Idle");
                 }
-                
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("🔄 Refresh").clicked() && !self.discovery_in_progress {
+                    if ui.button("🔄").clicked() && !self.discovery_in_progress {
                         self.start_camera_discovery();
                     }
                 });
@@ -941,7 +1076,12 @@ impl AxisCameraApp {
                                 } else {
                                     NORD_RED
                                 };
-                                ui.colored_label(status_color, "●");
+                                if camera.status == "discovered" {
+                                    ui.colored_label(NORD_GREEN, "✅");
+                                } else {
+                                    ui.colored_label(NORD_RED, "❌");
+                                }
+                                ui.add_space(12.0);
                                 ui.label(&camera.ip);
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -961,7 +1101,7 @@ impl AxisCameraApp {
                     } else {
                         ui.vertical_centered(|ui| {
                             ui.add_space(60.0);
-                            ui.label("💡 No cameras found");
+                            ui.label("No cameras found");
                             ui.add_space(8.0);
                             ui.colored_label(
                                 ui.visuals().weak_text_color(),
@@ -974,7 +1114,7 @@ impl AxisCameraApp {
     }
 
     fn show_console_card(&mut self, ui: &mut egui::Ui) {
-        Self::create_highlighted_card_frame(ui, "📝 Console", |ui| {
+        Self::create_highlighted_card_frame(ui, "Console", |ui| {
             egui::ScrollArea
                 ::vertical()
                 .id_salt("console_logs_scroll")
@@ -997,7 +1137,7 @@ impl AxisCameraApp {
                     } else {
                         ui.vertical_centered(|ui| {
                             ui.add_space(80.0);
-                            ui.label("📋 Console logs will appear here");
+                            ui.label("Console logs will appear here");
                             ui.add_space(4.0);
                             ui.colored_label(
                                 ui.visuals().weak_text_color(),
@@ -1010,86 +1150,143 @@ impl AxisCameraApp {
     }
 
     fn show_results_card(&mut self, ui: &mut egui::Ui) {
-        Self::create_highlighted_card_frame(ui, "📊 Results", |ui| {
-            ui.horizontal(|ui| {
-                ui.strong("Export Results:");
+        Self::create_highlighted_card_frame(ui, "Results", |ui| {
+            ui.vertical(|ui| {
+                // Header with export buttons
+                ui.horizontal(|ui| {
+                    ui.strong("Export Results:");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Export Excel").clicked() {
+                            if
+                                let Some(path) = rfd::FileDialog
+                                    ::new()
+                                    .add_filter("Excel files", &["xlsx"])
+                                    .set_file_name("camera_configuration_results.xlsx")
+                                    .save_file()
+                            {
+                                self.export_results_to_file(path);
+                            }
+                        }
+                        ui.add_space(4.0);
+                        if ui.button("Export CSV").clicked() {
+                            if
+                                let Some(path) = rfd::FileDialog
+                                    ::new()
+                                    .add_filter("CSV files", &["csv"])
+                                    .set_file_name("camera_configuration_results.csv")
+                                    .save_file()
+                            {
+                                self.export_results_to_file(path);
+                            }
+                        }
+                    });
+                });
+
+                ui.add_space(8.0);
+
+                // Main content area that fills available space
+                let available_height = ui.available_height() - 50.0; // Reserve space for reset button
+
+                egui::ScrollArea
+                    ::vertical()
+                    .id_salt("results_scroll")
+                    .auto_shrink([false; 2])
+                    .max_height(available_height)
+                    .show(ui, |ui| {
+                        if !self.processing_results.is_empty() {
+                            egui::Grid
+                                ::new("results_grid")
+                                .num_columns(6)
+                                .striped(true)
+                                .spacing([8.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.strong("IP Address");
+                                    ui.strong("MAC Address");
+                                    ui.strong("Serial");
+                                    ui.strong("Model");
+                                    ui.strong("Firmware");
+                                    ui.strong("Status");
+                                    ui.end_row();
+
+                                    for result in &self.processing_results {
+                                        ui.label(&result.ip_address);
+                                        ui.label(result.mac_address.as_deref().unwrap_or("-"));
+                                        ui.label(result.serial.as_deref().unwrap_or("-"));
+                                        ui.label(result.item_name.as_deref().unwrap_or("-"));
+                                        ui.label(result.firmware_version.as_deref().unwrap_or("-"));
+                                        ui.label(&result.status);
+                                        ui.end_row();
+                                    }
+                                });
+                        } else {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(60.0);
+                                ui.label("Configuration results will appear here");
+                                ui.add_space(8.0);
+                                ui.colored_label(
+                                    ui.visuals().weak_text_color(),
+                                    "Complete camera configuration to see results"
+                                );
+                            });
+                        }
+                    });
+
+                // Reset button at bottom right
+                ui.add_space(8.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("💾 Export Excel").clicked() {
-                        if
-                            let Some(path) = rfd::FileDialog
-                                ::new()
-                                .add_filter("Excel files", &["xlsx"])
-                                .set_file_name("camera_configuration_results.xlsx")
-                                .save_file()
-                        {
-                            self.export_results_to_file(path);
-                        }
-                    }
-                    ui.add_space(4.0);
-                    if ui.button("💾 Export CSV").clicked() {
-                        if
-                            let Some(path) = rfd::FileDialog
-                                ::new()
-                                .add_filter("CSV files", &["csv"])
-                                .set_file_name("camera_configuration_results.csv")
-                                .save_file()
-                        {
-                            self.export_results_to_file(path);
-                        }
+                    if ui.button("Reset & Clear Data").clicked() {
+                        self.reset_all_data();
                     }
                 });
             });
-
-            ui.add_space(8.0);
-
-            egui::ScrollArea
-                ::vertical()
-                .id_salt("results_scroll")
-                .auto_shrink([false; 2])
-                .max_height(180.0)
-                .show(ui, |ui| {
-                    if !self.processing_results.is_empty() {
-                        egui::Grid
-                            ::new("results_grid")
-                            .num_columns(6)
-                            .striped(true)
-                            .spacing([8.0, 4.0])
-                            .show(ui, |ui| {
-                                ui.strong("IP Address");
-                                ui.strong("MAC Address");
-                                ui.strong("Serial");
-                                ui.strong("Model");
-                                ui.strong("Firmware");
-                                ui.strong("Status");
-                                ui.end_row();
-
-                                for result in &self.processing_results {
-                                    ui.label(&result.ip_address);
-                                    ui.label(result.mac_address.as_deref().unwrap_or("-"));
-                                    ui.label(result.serial.as_deref().unwrap_or("-"));
-                                    ui.label(result.item_name.as_deref().unwrap_or("-"));
-                                    ui.label(result.firmware_version.as_deref().unwrap_or("-"));
-                                    ui.label(&result.status);
-                                    ui.end_row();
-                                }
-                            });
-                    } else {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(60.0);
-                            ui.label("📈 Configuration results will appear here");
-                            ui.add_space(8.0);
-                            ui.colored_label(
-                                ui.visuals().weak_text_color(),
-                                "Complete camera configuration to see results"
-                            );
-                        });
-                    }
-                });
         });
     }
 
     fn show_processing_screen(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.show_unified_layout(ui, ctx);
+    }
+
+    fn reset_all_data(&mut self) {
+        // Clear all data from the last run
+        self.processing_logs.clear();
+        self.processing_results.clear();
+        self.discovered_cameras.clear();
+        self.dhcp_leases.clear();
+
+        // Reset processing state
+        self.processing_in_progress = false;
+        self.discovery_in_progress = false;
+        self.last_scan_time = None;
+
+        // Reset screen to main configuration
+        self.current_screen = Screen::MainConfiguration;
+
+        // Clear any active channels
+        if let Some(channels) = &mut self.channels {
+            channels.discovery_rx = None;
+            channels.discovery_complete_rx = None;
+            channels.processing_log_rx = None;
+            channels.processing_result_rx = None;
+            channels.processing_complete_rx = None;
+        }
+
+        // Restart DHCP server to clear any cached state
+        if self.dhcp_running {
+            self.stop_dhcp_server();
+            // Give a small delay before restarting
+            if let Some(rt) = &self.rt {
+                rt.spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                });
+
+                // We'll restart DHCP immediately since we have the interface selected
+                if self.selected_interface.is_some() {
+                    self.start_dhcp_server();
+                }
+            }
+        }
+
+        info!("All data cleared and DHCP server restarted");
     }
 
     fn start_dhcp_server(&mut self) {
@@ -1109,8 +1306,10 @@ impl AxisCameraApp {
                     self.dhcp_shutdown_tx = Some(shutdown_tx);
 
                     let (lease_tx, lease_rx) = mpsc::unbounded_channel::<Vec<DhcpLease>>();
-                    self.lease_refresh_rx = Some(lease_rx);
-                    self.lease_update_tx = Some(lease_tx.clone());
+                    if let Some(channels) = &mut self.channels {
+                        channels.lease_refresh_rx = Some(lease_rx);
+                        channels.lease_update_tx = Some(lease_tx.clone());
+                    }
 
                     let dhcp_manager = Arc::new(Mutex::new(DhcpManager::new()));
                     self.dhcp_manager = Some(dhcp_manager.clone());
@@ -1160,8 +1359,10 @@ impl AxisCameraApp {
         }
         self.dhcp_running = false;
         self.dhcp_manager = None;
-        self.lease_update_tx = None;
-        self.lease_refresh_rx = None;
+        if let Some(channels) = &mut self.channels {
+            channels.lease_update_tx = None;
+            channels.lease_refresh_rx = None;
+        }
         info!("DHCP server stopped");
     }
 
@@ -1176,8 +1377,10 @@ impl AxisCameraApp {
         let (discovery_tx, discovery_rx) = mpsc::unbounded_channel::<Vec<DeviceInfo>>();
         let (complete_tx, complete_rx) = mpsc::unbounded_channel::<bool>();
 
-        self.discovery_rx = Some(discovery_rx);
-        self.discovery_complete_rx = Some(complete_rx);
+        if let Some(channels) = &mut self.channels {
+            channels.discovery_rx = Some(discovery_rx);
+            channels.discovery_complete_rx = Some(complete_rx);
+        }
 
         let network_to_scan = if let Some(interface_index) = self.selected_interface {
             if let Some(interface) = self.dhcp_interfaces.get(interface_index) {
@@ -1219,8 +1422,9 @@ impl AxisCameraApp {
     }
 
     fn process_discovery_messages(&mut self) {
-        if let Some(rx) = &mut self.discovery_rx {
-            while let Ok(mut cameras) = rx.try_recv() {
+        if let Some(channels) = &mut self.channels {
+            if let Some(rx) = &mut channels.discovery_rx {
+                while let Ok(mut cameras) = rx.try_recv() {
                 for camera in &mut cameras {
                     for lease in &self.dhcp_leases {
                         if lease.ip.to_string() == camera.ip {
@@ -1281,17 +1485,19 @@ impl AxisCameraApp {
                 }
 
                 // Prevent memory bloat in large deployments by limiting camera list size
-                if self.discovered_cameras.len() > 75 {
-                    self.discovered_cameras.truncate(50);
+                // Use capacity management instead of truncation to avoid frequent reallocations
+                if self.discovered_cameras.len() > 100 {
+                    self.discovered_cameras.drain(0..25);
+                    self.discovered_cameras.shrink_to_fit();
                 }
             }
         }
 
-        if let Some(rx) = &mut self.discovery_complete_rx {
-            if rx.try_recv().is_ok() {
-                self.discovery_in_progress = false;
-                self.discovery_rx = None;
-                self.discovery_complete_rx = None;
+            if let Some(rx) = &mut channels.discovery_complete_rx {
+                if rx.try_recv().is_ok() {
+                    self.discovery_in_progress = false;
+                    channels.discovery_rx = None;
+                    channels.discovery_complete_rx = None;
                 info!(
                     "Camera discovery completed. Found {} cameras (DHCP leases: {})",
                     self.discovered_cameras.len(),
@@ -1300,60 +1506,63 @@ impl AxisCameraApp {
             }
         }
 
-        if let Some(rx) = &mut self.processing_log_rx {
-            while let Ok(log_message) = rx.try_recv() {
-                self.processing_logs.push(log_message);
-                if self.processing_logs.len() > 200 {
-                    self.processing_logs.drain(0..100);
+            if let Some(rx) = &mut channels.processing_log_rx {
+                while let Ok(log_message) = rx.try_recv() {
+                    self.processing_logs.push(log_message);
+                    if self.processing_logs.len() > 200 {
+                        self.processing_logs.drain(0..100);
+                        self.processing_logs.shrink_to_fit();
+                    }
                 }
             }
-        }
 
-        if let Some(rx) = &mut self.processing_result_rx {
-            while let Ok(result) = rx.try_recv() {
-                self.processing_results.push(result);
-                if self.processing_results.len() > 75 {
-                    self.processing_results.drain(0..25);
+            if let Some(rx) = &mut channels.processing_result_rx {
+                while let Ok(result) = rx.try_recv() {
+                    self.processing_results.push(result);
+                    if self.processing_results.len() > 75 {
+                        self.processing_results.drain(0..25);
+                        self.processing_results.shrink_to_fit();
+                    }
                 }
             }
-        }
 
-        if let Some(rx) = &mut self.processing_complete_rx {
-            if rx.try_recv().is_ok() {
-                self.processing_in_progress = false;
-                self.processing_log_rx = None;
-                self.processing_result_rx = None;
-                self.processing_complete_rx = None;
+            if let Some(rx) = &mut channels.processing_complete_rx {
+                if rx.try_recv().is_ok() {
+                    self.processing_in_progress = false;
+                    channels.processing_log_rx = None;
+                    channels.processing_result_rx = None;
+                    channels.processing_complete_rx = None;
                 info!("Camera configuration completed!");
             }
         }
 
-        if let Some(rx) = &mut self.lease_refresh_rx {
-            while let Ok(leases) = rx.try_recv() {
-                self.dhcp_leases = leases;
-                info!("DHCP leases updated: {} active leases", self.dhcp_leases.len());
+            if let Some(rx) = &mut channels.lease_refresh_rx {
+                while let Ok(leases) = rx.try_recv() {
+                    self.dhcp_leases = leases;
+                    info!("DHCP leases updated: {} active leases", self.dhcp_leases.len());
 
-                for camera in &mut self.discovered_cameras {
-                    if camera.mac_address.is_none() {
-                        for lease in &self.dhcp_leases {
-                            if lease.ip.to_string() == camera.ip {
-                                camera.mac_address = Some(
-                                    format!(
-                                        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                                        lease.mac[0],
-                                        lease.mac[1],
-                                        lease.mac[2],
-                                        lease.mac[3],
-                                        lease.mac[4],
-                                        lease.mac[5]
-                                    )
-                                );
-                                info!(
-                                    "Updated MAC address for camera at {}: {}",
-                                    camera.ip,
-                                    camera.mac_address.as_ref().unwrap()
-                                );
-                                break;
+                    for camera in &mut self.discovered_cameras {
+                        if camera.mac_address.is_none() {
+                            for lease in &self.dhcp_leases {
+                                if lease.ip.to_string() == camera.ip {
+                                    camera.mac_address = Some(
+                                        format!(
+                                            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                            lease.mac[0],
+                                            lease.mac[1],
+                                            lease.mac[2],
+                                            lease.mac[3],
+                                            lease.mac[4],
+                                            lease.mac[5]
+                                        )
+                                    );
+                                    info!(
+                                        "Updated MAC address for camera at {}: {}",
+                                        camera.ip,
+                                        camera.mac_address.as_ref().unwrap()
+                                    );
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1361,6 +1570,58 @@ impl AxisCameraApp {
             }
         }
     }
+    
+    /// Create camera list ordered by DHCP lease assignment order
+    fn create_dhcp_ordered_camera_list(&self) -> Vec<DeviceInfo> {
+        let mut ordered_cameras = Vec::new();
+        
+        // First, create a map of MAC addresses to cameras
+        let mut mac_to_camera: std::collections::HashMap<String, DeviceInfo> = std::collections::HashMap::new();
+        for camera in &self.discovered_cameras {
+            if let Some(mac) = &camera.mac_address {
+                mac_to_camera.insert(mac.clone(), camera.clone());
+            }
+        }
+        
+        // Sort DHCP leases by lease start time to get the order cameras were plugged in
+        let mut sorted_leases = self.dhcp_leases.clone();
+        sorted_leases.sort_by(|a, b| a.lease_start.cmp(&b.lease_start));
+        
+        // Add cameras in DHCP lease order
+        for lease in sorted_leases {
+            let mac_str = format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                lease.mac[0], lease.mac[1], lease.mac[2], 
+                lease.mac[3], lease.mac[4], lease.mac[5]
+            );
+            
+            if let Some(camera) = mac_to_camera.remove(&mac_str) {
+                ordered_cameras.push(camera);
+            }
+        }
+        
+        // Add any remaining cameras that don't have DHCP leases (shouldn't happen but safety net)
+        for camera in &self.discovered_cameras {
+            if let Some(mac) = &camera.mac_address {
+                if mac_to_camera.contains_key(mac) {
+                    ordered_cameras.push(camera.clone());
+                }
+            } else {
+                // Camera without MAC address, add to end
+                ordered_cameras.push(camera.clone());
+            }
+        }
+        
+        info!(
+            "Ordered {} cameras by DHCP lease assignment order (original: {})",
+            ordered_cameras.len(),
+            self.discovered_cameras.len()
+        );
+        
+        ordered_cameras
+    }
+    
+    
     fn start_camera_configuration(&mut self) {
         self.processing_in_progress = true;
         self.processing_logs.clear();
@@ -1374,9 +1635,11 @@ impl AxisCameraApp {
         let (result_tx, result_rx) = mpsc::unbounded_channel::<CameraInventoryData>();
         let (complete_tx, complete_rx) = mpsc::unbounded_channel::<bool>();
 
-        self.processing_log_rx = Some(log_rx);
-        self.processing_result_rx = Some(result_rx);
-        self.processing_complete_rx = Some(complete_rx);
+        if let Some(channels) = &mut self.channels {
+            channels.processing_log_rx = Some(log_rx);
+            channels.processing_result_rx = Some(result_rx);
+            channels.processing_complete_rx = Some(complete_rx);
+        }
 
         let target_ips = match self.parse_ip_range(&self.ip_range_input) {
             Ok(ips) => ips,
@@ -1389,11 +1652,19 @@ impl AxisCameraApp {
             }
         };
 
-        let discovered_cameras = self.discovered_cameras.clone();
-        let admin_password = self.admin_password.clone();
-        let camera_subnet_mask = self.camera_subnet_mask.clone();
-        let camera_gateway = self.camera_gateway.clone();
-        let firmware_mapping = self.firmware_mapping.clone();
+        // Create ordered camera list based on DHCP lease order
+        let ordered_cameras = self.create_dhcp_ordered_camera_list();
+        
+        // Use Arc to share data instead of cloning
+        let discovered_cameras = Arc::new(ordered_cameras);
+        let dhcp_manager_ref = self.dhcp_manager.clone();
+        let config_data = Arc::new(ConfigData {
+            admin_password: self.admin_password.clone(),
+            camera_subnet_mask: self.camera_subnet_mask.clone(),
+            camera_gateway: self.camera_gateway.clone(),
+            firmware_mapping: self.firmware_mapping.clone(),
+            target_ips: Arc::new(target_ips),
+        });
 
         if let Some(rt) = &self.rt {
             rt.spawn(async move {
@@ -1401,47 +1672,45 @@ impl AxisCameraApp {
                     format!("[{}] Initializing camera operations...", Utc::now().format("%H:%M:%S"))
                 );
 
-                let has_firmware = !firmware_mapping.firmware_files.is_empty();
+                let has_firmware = !config_data.firmware_mapping.firmware_files.is_empty();
                 if has_firmware {
                     let _ = log_tx.send(
                         format!(
                             "[{}] {} firmware file(s) loaded for model-based upgrades",
                             Utc::now().format("%H:%M:%S"),
-                            firmware_mapping.firmware_files.len()
+                            config_data.firmware_mapping.firmware_files.len()
                         )
                     );
                 }
 
-                // Limit concurrent camera operations to prevent network/resource exhaustion
-                let semaphore = Arc::new(Semaphore::new(10));
+                // Increase concurrent camera operations for faster processing
+                let semaphore = Arc::new(Semaphore::new(15));
 
                 let mut handles = Vec::new();
 
                 let total_cameras = discovered_cameras.len();
 
-                for (index, camera) in discovered_cameras.into_iter().enumerate() {
+                for (index, camera) in discovered_cameras.iter().enumerate() {
                     let log_tx_clone = log_tx.clone();
                     let result_tx_clone = result_tx.clone();
-                    let semaphore_clone = semaphore.clone();
-
-                    let admin_password_clone = admin_password.clone();
-                    let firmware_mapping_clone = firmware_mapping.clone();
-                    let camera_subnet_mask_clone = camera_subnet_mask.clone();
-                    let camera_gateway_clone = camera_gateway.clone();
-                    let target_ips_clone = target_ips.clone();
+                    let semaphore_clone = Arc::clone(&semaphore);
+                    let config_data_clone = Arc::clone(&config_data);
+                    let dhcp_manager_clone = dhcp_manager_ref.clone();
+                    let camera_clone = camera.clone();
 
                     let handle = tokio::spawn(async move {
                         let _permit = semaphore_clone
                             .acquire().await
                             .expect("Semaphore acquire failed");
 
+                        let camera_start_time = std::time::Instant::now();
                         let _ = log_tx_clone.send(
                             format!(
-                                "[{}] Starting configuration for camera {}/{} (IP: {})",
+                                "[{}] 🚀 Starting configuration for camera {}/{} (IP: {})",
                                 Utc::now().format("%H:%M:%S"),
                                 index + 1,
                                 total_cameras,
-                                camera.ip
+                                camera_clone.ip
                             )
                         );
 
@@ -1452,18 +1721,18 @@ impl AxisCameraApp {
                                     format!(
                                         "[{}] Failed to initialize camera operations for {}: {}",
                                         Utc::now().format("%H:%M:%S"),
-                                        camera.ip,
+                                        camera_clone.ip,
                                         e
                                     )
                                 );
                                 let camera_data = CameraInventoryData {
-                                    ip_address: camera.ip.clone(),
-                                    subnet: camera_subnet_mask_clone.clone(),
-                                    gateway: camera_gateway_clone.clone(),
-                                    user_name: "root".to_string(),
-                                    password: admin_password_clone.clone(),
+                                    ip_address: camera_clone.ip.clone(),
+                                    subnet: config_data_clone.camera_subnet_mask.clone(),
+                                    gateway: config_data_clone.camera_gateway.clone(),
+                                    user_name: ROOT_USERNAME.to_string(),
+                                    password: config_data_clone.admin_password.clone(),
                                     completion_time: Utc::now(),
-                                    status: "Failed - Init".to_string(),
+                                    status: FAILED_INIT_STATUS.to_string(),
                                     device_map: None,
                                     ..Default::default()
                                 };
@@ -1472,25 +1741,25 @@ impl AxisCameraApp {
                             }
                         };
 
-                        let camera_ip = match camera.ip.parse::<std::net::Ipv4Addr>() {
+                        let camera_ip = match camera_clone.ip.parse::<std::net::Ipv4Addr>() {
                             Ok(ip) => ip,
                             Err(e) => {
                                 let _ = log_tx_clone.send(
                                     format!(
                                         "[{}] Invalid IP address {}: {}",
                                         Utc::now().format("%H:%M:%S"),
-                                        camera.ip,
+                                        camera_clone.ip,
                                         e
                                     )
                                 );
                                 let camera_data = CameraInventoryData {
-                                    ip_address: camera.ip.clone(),
-                                    subnet: camera_subnet_mask_clone.clone(),
-                                    gateway: camera_gateway_clone.clone(),
-                                    user_name: "root".to_string(),
-                                    password: admin_password_clone.clone(),
+                                    ip_address: camera_clone.ip.clone(),
+                                    subnet: config_data_clone.camera_subnet_mask.clone(),
+                                    gateway: config_data_clone.camera_gateway.clone(),
+                                    user_name: ROOT_USERNAME.to_string(),
+                                    password: config_data_clone.admin_password.clone(),
                                     completion_time: Utc::now(),
-                                    status: "Failed - Invalid IP".to_string(),
+                                    status: FAILED_INVALID_IP_STATUS.to_string(),
                                     device_map: None,
                                     ..Default::default()
                                 };
@@ -1500,27 +1769,27 @@ impl AxisCameraApp {
                         };
 
                         let mut camera_data = CameraInventoryData {
-                            ip_address: camera.ip.clone(),
-                            subnet: camera_subnet_mask_clone.clone(),
-                            gateway: camera_gateway_clone.clone(),
-                            mac_address: camera.mac_address.clone(),
+                            ip_address: camera_clone.ip.clone(),
+                            subnet: config_data_clone.camera_subnet_mask.clone(),
+                            gateway: config_data_clone.camera_gateway.clone(),
+                            mac_address: camera_clone.mac_address.clone(),
                             serial: None,
                             firmware_version: None,
                             item_name: None,
                             user_name: "root".to_string(),
-                            password: admin_password_clone.clone(),
+                            password: config_data_clone.admin_password.clone(),
                             device_map: None,
                             completion_time: Utc::now(),
-                            status: "Processing".to_owned(),
+                            status: PROCESSING_STATUS.to_owned(),
                             operations: OperationResults::default(),
-                            tool_version: "1.0.0".to_string(),
+                            tool_version: TOOL_VERSION.to_string(),
                         };
 
                         let _ = log_tx_clone.send(
                             format!(
                                 "[{}] Creating admin user for {}",
                                 Utc::now().format("%H:%M:%S"),
-                                camera.ip
+                                camera_clone.ip
                             )
                         );
 
@@ -1528,7 +1797,7 @@ impl AxisCameraApp {
                             camera_ops.create_initial_admin(
                                 camera_ip,
                                 "root",
-                                &admin_password_clone,
+                                &config_data_clone.admin_password,
                                 camera_operations::Protocol::Http
                             ).await
                         {
@@ -1540,7 +1809,7 @@ impl AxisCameraApp {
                                     format!(
                                         "[{}] ✅ Admin user created for {}",
                                         Utc::now().format("%H:%M:%S"),
-                                        camera.ip
+                                        camera_clone.ip
                                     )
                                 );
 
@@ -1548,22 +1817,20 @@ impl AxisCameraApp {
                                     camera_ops.get_device_info(
                                         camera_ip,
                                         "root",
-                                        &admin_password_clone,
+                                        &config_data_clone.admin_password,
                                         camera_operations::Protocol::Http
                                     ).await
                                 {
                                     Ok(device_info) => {
                                         if let Some(model_obj) = device_info.get("ProdNbr") {
                                             if let Some(model_str) = model_obj.as_str() {
-                                                camera_data.item_name = Some(
-                                                    model_str.to_string()
-                                                );
+                                                camera_data.item_name = Some(model_str.to_string());
                                                 let _ = log_tx_clone.send(
                                                     format!(
                                                         "[{}] Detected camera model: {} for {}",
                                                         Utc::now().format("%H:%M:%S"),
                                                         model_str,
-                                                        camera.ip
+                                                        camera_clone.ip
                                                     )
                                                 );
                                             }
@@ -1584,9 +1851,13 @@ impl AxisCameraApp {
                                             format!(
                                                 "[{}] Device info retrieved for {} (Model: {}, FW: {})",
                                                 Utc::now().format("%H:%M:%S"),
-                                                camera.ip,
-                                                camera_data.item_name.as_deref().unwrap_or("Unknown"),
-                                                camera_data.firmware_version.as_deref().unwrap_or("Unknown")
+                                                camera_clone.ip,
+                                                camera_data.item_name
+                                                    .as_deref()
+                                                    .unwrap_or("Unknown"),
+                                                camera_data.firmware_version
+                                                    .as_deref()
+                                                    .unwrap_or("Unknown")
                                             )
                                         );
                                     }
@@ -1595,7 +1866,7 @@ impl AxisCameraApp {
                                             format!(
                                                 "[{}] Could not get device info for {}: {}",
                                                 Utc::now().format("%H:%M:%S"),
-                                                camera.ip,
+                                                camera_clone.ip,
                                                 e
                                             )
                                         );
@@ -1607,7 +1878,7 @@ impl AxisCameraApp {
                                         camera_ops.get_network_interface_info(
                                             camera_ip,
                                             "root",
-                                            &admin_password_clone,
+                                            &config_data_clone.admin_password,
                                             camera_operations::Protocol::Http
                                         ).await
                                     {
@@ -1617,8 +1888,10 @@ impl AxisCameraApp {
                                                 format!(
                                                     "[{}] MAC address retrieved via VAPIX for {}: {}",
                                                     Utc::now().format("%H:%M:%S"),
-                                                    camera.ip,
-                                                    camera_data.mac_address.as_deref().unwrap_or("Unknown")
+                                                    camera_clone.ip,
+                                                    camera_data.mac_address
+                                                        .as_deref()
+                                                        .unwrap_or("Unknown")
                                                 )
                                             );
                                         }
@@ -1627,7 +1900,7 @@ impl AxisCameraApp {
                                                 format!(
                                                     "[{}] Could not retrieve MAC address via VAPIX for {}",
                                                     Utc::now().format("%H:%M:%S"),
-                                                    camera.ip
+                                                    camera_clone.ip
                                                 )
                                             );
                                         }
@@ -1636,7 +1909,7 @@ impl AxisCameraApp {
                                                 format!(
                                                     "[{}] Error getting MAC address for {}: {}",
                                                     Utc::now().format("%H:%M:%S"),
-                                                    camera.ip,
+                                                    camera_clone.ip,
                                                     e
                                                 )
                                             );
@@ -1652,7 +1925,7 @@ impl AxisCameraApp {
                                     format!(
                                         "[{}] ❌ Failed to create admin user for {}: {}",
                                         Utc::now().format("%H:%M:%S"),
-                                        camera.ip,
+                                        camera_clone.ip,
                                         e
                                     )
                                 );
@@ -1672,33 +1945,37 @@ impl AxisCameraApp {
 
                         let _ = log_tx_clone.send(
                             format!(
-                                "[{}] Waiting for user accounts to become active on {}...",
+                                "[{}] ⏱️ Admin user created, waiting 1s for activation on {}",
                                 Utc::now().format("%H:%M:%S"),
-                                camera.ip
+                                camera_clone.ip
                             )
                         );
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
 
-                        if !firmware_mapping_clone.firmware_files.is_empty() {
+                        if !config_data_clone.firmware_mapping.firmware_files.is_empty() {
                             let model_name = camera_data.item_name.as_deref().unwrap_or("Unknown");
                             let _ = log_tx_clone.send(
                                 format!(
-                                    "[{}] Checking firmware compatibility for {} (Model: {})...",
+                                    "[{}] 🔍 Checking firmware compatibility for {} (Model: {})...",
                                     Utc::now().format("%H:%M:%S"),
-                                    camera.ip,
+                                    camera_clone.ip,
                                     model_name
                                 )
                             );
-                            
+
                             // Check if we have compatible firmware before attempting upgrade
-                            if let Some(firmware_file) = firmware_mapping_clone.find_firmware_for_model(model_name) {
+                            if
+                                let Some(firmware_file) =
+                                    config_data_clone.firmware_mapping.find_firmware_for_model(model_name)
+                            {
+                                let firmware_start_time = std::time::Instant::now();
                                 let _ = log_tx_clone.send(
                                     format!(
-                                        "[{}] Found compatible firmware '{}' for model '{}' at {}",
+                                        "[{}] 🔄 Found compatible firmware '{}' for model '{}', starting upload to {}",
                                         Utc::now().format("%H:%M:%S"),
                                         firmware_file.filename,
                                         model_name,
-                                        camera.ip
+                                        camera_clone.ip
                                     )
                                 );
 
@@ -1706,98 +1983,101 @@ impl AxisCameraApp {
                                     camera_ops.upgrade_firmware_with_model_mapping(
                                         camera_ip,
                                         "root",
-                                        &admin_password_clone,
-                                        &firmware_mapping_clone,
+                                        &config_data_clone.admin_password,
+                                        &config_data_clone.firmware_mapping,
                                         camera_operations::Protocol::Http,
                                         None
                                     ).await
                                 {
-                                Ok(msg) => {
-                                    camera_data.operations.upgrade_firmware = Some(
-                                        OperationResult::success(msg)
-                                    );
-                                    let _ = log_tx_clone.send(
-                                        format!(
-                                            "[{}] ✅ Firmware upgrade completed for {}",
-                                            Utc::now().format("%H:%M:%S"),
-                                            camera.ip
-                                        )
-                                    );
+                                    Ok(msg) => {
+                                        let firmware_duration = firmware_start_time.elapsed();
+                                        camera_data.operations.upgrade_firmware = Some(
+                                            OperationResult::success(msg)
+                                        );
+                                        let _ = log_tx_clone.send(
+                                            format!(
+                                                "[{}] ✅ Firmware upgrade completed for {} (took {:.1}s)",
+                                                Utc::now().format("%H:%M:%S"),
+                                                camera_clone.ip,
+                                                firmware_duration.as_secs_f32()
+                                            )
+                                        );
 
-                                    let _ = log_tx_clone.send(
-                                        format!(
-                                            "[{}] Retrieving updated firmware version for {}...",
-                                            Utc::now().format("%H:%M:%S"),
-                                            camera.ip
-                                        )
-                                    );
+                                        let _ = log_tx_clone.send(
+                                            format!(
+                                                "[{}] Retrieving updated firmware version for {}...",
+                                                Utc::now().format("%H:%M:%S"),
+                                                camera_clone.ip
+                                            )
+                                        );
 
-                                    match
-                                        camera_ops.get_device_info(
-                                            camera_ip,
-                                            "root",
-                                            &admin_password_clone,
-                                            camera_operations::Protocol::Http
-                                        ).await
-                                    {
-                                        Ok(device_info) => {
-                                            if let Some(fw_obj) = device_info.get("Version") {
-                                                if let Some(fw_str) = fw_obj.as_str() {
-                                                    camera_data.firmware_version = Some(
-                                                        fw_str.to_string()
-                                                    );
-                                                    let _ = log_tx_clone.send(
-                                                        format!(
-                                                            "[{}] Updated firmware version for {}: {}",
-                                                            Utc::now().format("%H:%M:%S"),
-                                                            camera.ip,
-                                                            fw_str
-                                                        )
-                                                    );
+                                        match
+                                            camera_ops.get_device_info(
+                                                camera_ip,
+                                                "root",
+                                                &config_data_clone.admin_password,
+                                                camera_operations::Protocol::Http
+                                            ).await
+                                        {
+                                            Ok(device_info) => {
+                                                if let Some(fw_obj) = device_info.get("Version") {
+                                                    if let Some(fw_str) = fw_obj.as_str() {
+                                                        camera_data.firmware_version = Some(
+                                                            fw_str.to_string()
+                                                        );
+                                                        let _ = log_tx_clone.send(
+                                                            format!(
+                                                                "[{}] Updated firmware version for {}: {}",
+                                                                Utc::now().format("%H:%M:%S"),
+                                                                camera_clone.ip,
+                                                                fw_str
+                                                            )
+                                                        );
+                                                    }
                                                 }
                                             }
-                                        }
-                                        Err(e) => {
-                                            let _ = log_tx_clone.send(
-                                                format!(
-                                                    "[{}] Could not get updated firmware version for {}: {}",
-                                                    Utc::now().format("%H:%M:%S"),
-                                                    camera.ip,
-                                                    e
-                                                )
-                                            );
+                                            Err(e) => {
+                                                let _ = log_tx_clone.send(
+                                                    format!(
+                                                        "[{}] Could not get updated firmware version for {}: {}",
+                                                        Utc::now().format("%H:%M:%S"),
+                                                        camera_clone.ip,
+                                                        e
+                                                    )
+                                                );
+                                            }
                                         }
                                     }
+                                    Err(e) => {
+                                        let error_string = e.to_string();
+                                        camera_data.operations.upgrade_firmware = Some(
+                                            OperationResult::failure(error_string.clone())
+                                        );
+                                        let _ = log_tx_clone.send(
+                                            format!(
+                                                "[{}] ❌ Firmware upgrade failed for {}: {}",
+                                                Utc::now().format("%H:%M:%S"),
+                                                camera_clone.ip,
+                                                error_string
+                                            )
+                                        );
+                                    }
                                 }
-                                Err(e) => {
-                                    let error_string = e.to_string();
-                                    camera_data.operations.upgrade_firmware = Some(
-                                        OperationResult::failure(error_string.clone())
-                                    );
-                                    let _ = log_tx_clone.send(
-                                        format!(
-                                            "[{}] ❌ Firmware upgrade failed for {}: {}",
-                                            Utc::now().format("%H:%M:%S"),
-                                            camera.ip,
-                                            error_string
-                                        )
-                                    );
-                                }
-                            }
                             } else {
                                 let _ = log_tx_clone.send(
                                     format!(
                                         "[{}] ⚠️ Skipping firmware upgrade for {} - no compatible firmware found for model '{}'",
                                         Utc::now().format("%H:%M:%S"),
-                                        camera.ip,
+                                        camera_clone.ip,
                                         model_name
                                     )
                                 );
-                                let available_models: Vec<String> = firmware_mapping_clone.firmware_files
-                                    .iter()
-                                    .flat_map(|fw| fw.compatible_models.iter())
-                                    .cloned()
-                                    .collect();
+                                let available_models: Vec<String> =
+                                    config_data_clone.firmware_mapping.firmware_files
+                                        .iter()
+                                        .flat_map(|fw| fw.compatible_models.iter())
+                                        .cloned()
+                                        .collect();
                                 let _ = log_tx_clone.send(
                                     format!(
                                         "[{}] Available firmware models: {}",
@@ -1811,12 +2091,23 @@ impl AxisCameraApp {
                                 format!(
                                     "[{}] Skipping firmware upgrade for {} - no firmware files loaded",
                                     Utc::now().format("%H:%M:%S"),
-                                    camera.ip
+                                    camera_clone.ip
                                 )
                             );
                         }
 
-                        let target_ip_str = target_ips_clone.get(index).cloned();
+                        // Get target IP based on the ordered index (DHCP lease order)
+                        let target_ip_str = config_data_clone.target_ips.get(index).cloned();
+                        
+                        let _ = log_tx_clone.send(
+                            format!(
+                                "[{}] Assigning target IP {} to camera {} (DHCP order: {})",
+                                Utc::now().format("%H:%M:%S"),
+                                target_ip_str.as_deref().unwrap_or("none"),
+                                camera_clone.ip,
+                                index + 1
+                            )
+                        );
 
                         if let Some(new_ip_str) = target_ip_str {
                             let _new_ip_addr = match new_ip_str.parse::<std::net::Ipv4Addr>() {
@@ -1827,7 +2118,7 @@ impl AxisCameraApp {
                                             "[{}] ❌ Invalid target IP '{}' for {}: {}",
                                             Utc::now().format("%H:%M:%S"),
                                             new_ip_str,
-                                            camera.ip,
+                                            camera_clone.ip,
                                             e
                                         )
                                     );
@@ -1846,52 +2137,84 @@ impl AxisCameraApp {
                             };
 
                             // Only configure static IP if different from current DHCP assignment
-                            if new_ip_str != camera.ip {
+                            if new_ip_str != camera_clone.ip {
                                 let _ = log_tx_clone.send(
                                     format!(
                                         "[{}] Setting static IP {} (subnet: {}, gateway: {}) for camera currently at {}",
                                         Utc::now().format("%H:%M:%S"),
                                         new_ip_str,
-                                        camera_subnet_mask_clone,
-                                        camera_gateway_clone,
-                                        camera.ip
+                                        config_data_clone.camera_subnet_mask,
+                                        config_data_clone.camera_gateway,
+                                        camera_clone.ip
                                     )
                                 );
 
                                 let ip_config = IpConfig {
                                     ip: new_ip_str.clone(),
-                                    subnet: camera_subnet_mask_clone.clone(),
-                                    gateway: camera_gateway_clone.clone(),
+                                    subnet: config_data_clone.camera_subnet_mask.clone(),
+                                    gateway: config_data_clone.camera_gateway.clone(),
+                                };
+
+                                // Get camera MAC address for tracking
+                                let camera_mac = camera_data.mac_address.as_deref().unwrap_or("unknown");
+                                
+                                // Create closure to get current DHCP leases
+                                let dhcp_manager_for_closure = dhcp_manager_clone.clone();
+                                let get_current_leases = move || {
+                                    if let Some(manager) = dhcp_manager_for_closure.as_ref() {
+                                        // Use tokio::task::block_in_place to run async code in sync context
+                                        tokio::task::block_in_place(|| {
+                                            tokio::runtime::Handle::current().block_on(async {
+                                                manager.lock().await.get_active_leases().await
+                                            })
+                                        })
+                                    } else {
+                                        Vec::new()
+                                    }
                                 };
 
                                 match
-                                    camera_ops.set_final_static_ip(
-                                        camera_ip, // Still the current IP for the request
+                                    camera_ops.set_final_static_ip_with_mac_tracking(
+                                        camera_ip, // Current IP for the request
                                         "root",
-                                        &admin_password_clone,
+                                        &config_data_clone.admin_password,
                                         &ip_config,
-                                        camera_operations::Protocol::Http
+                                        camera_operations::Protocol::Http,
+                                        camera_mac,
+                                        get_current_leases
                                     ).await
                                 {
-                                    Ok(msg) => {
+                                    Ok((msg, new_dhcp_ip)) => {
                                         camera_data.operations.set_static_ip = Some(
                                             OperationResult::success(msg.clone())
                                         );
                                         camera_data.ip_address = new_ip_str.clone();
-                                        let _ = log_tx_clone.send(
-                                            format!(
-                                                "[{}] ✅ Static IP configuration sent to camera at {}, target IP: {}",
-                                                Utc::now().format("%H:%M:%S"),
-                                                camera.ip,
-                                                new_ip_str
-                                            )
-                                        );
+                                        
+                                        if let Some(dhcp_ip) = new_dhcp_ip {
+                                            let _ = log_tx_clone.send(
+                                                format!(
+                                                    "[{}] ✅ Camera moved to new DHCP IP {} after configuration (target static IP: {})",
+                                                    Utc::now().format("%H:%M:%S"),
+                                                    dhcp_ip,
+                                                    new_ip_str
+                                                )
+                                            );
+                                        } else {
+                                            let _ = log_tx_clone.send(
+                                                format!(
+                                                    "[{}] ✅ Static IP configuration sent to camera at {}, target IP: {}",
+                                                    Utc::now().format("%H:%M:%S"),
+                                                    camera_clone.ip,
+                                                    new_ip_str
+                                                )
+                                            );
+                                        }
 
                                         let _ = log_tx_clone.send(
                                             format!(
-                                                "[{}] Waiting for camera to restart at new IP: {}",
+                                                "[{}] Configuration completed for camera (MAC: {})",
                                                 Utc::now().format("%H:%M:%S"),
-                                                new_ip_str
+                                                camera_data.mac_address.as_deref().unwrap_or("unknown")
                                             )
                                         );
                                     }
@@ -1913,7 +2236,7 @@ impl AxisCameraApp {
                                     format!(
                                         "[{}] Camera {} already has target IP, skipping IP change",
                                         Utc::now().format("%H:%M:%S"),
-                                        camera.ip
+                                        camera_clone.ip
                                     )
                                 );
                             }
@@ -1922,7 +2245,7 @@ impl AxisCameraApp {
                                 format!(
                                     "[{}] No target IP determined for camera {}, skipping IP change",
                                     Utc::now().format("%H:%M:%S"),
-                                    camera.ip
+                                    camera_clone.ip
                                 )
                             );
                             camera_data.operations.set_static_ip = Some(
@@ -1951,6 +2274,16 @@ impl AxisCameraApp {
                             "Failed".to_string()
                         };
 
+                        let total_duration = camera_start_time.elapsed();
+                        let _ = log_tx_clone.send(
+                            format!(
+                                "[{}] ⚡ Camera {} configuration completed in {:.1}s",
+                                Utc::now().format("%H:%M:%S"),
+                                camera_clone.ip,
+                                total_duration.as_secs_f32()
+                            )
+                        );
+
                         let _ = result_tx_clone.send(camera_data);
                     });
                     handles.push(handle);
@@ -1972,11 +2305,13 @@ impl AxisCameraApp {
             });
         }
     }
+    
     fn export_results_to_file(&self, path: PathBuf) {
         let csv_handler = CsvHandler::new();
-        
+
         // Determine file type by extension
-        let is_excel = path.extension()
+        let is_excel = path
+            .extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_lowercase() == "xlsx")
             .unwrap_or(false);
@@ -1984,13 +2319,21 @@ impl AxisCameraApp {
         // If we have imported data, merge new results with existing data
         if !self.imported_csv_data.is_empty() && !self.csv_import_file_path.is_empty() {
             info!("Merging new results with existing data from: {}", self.csv_import_file_path);
-            
-            let result = if is_excel {
-                csv_handler.update_inventory_excel(&path, &self.processing_results)
+
+            // Update the original import file with new configuration data
+            let import_path = std::path::Path::new(&self.csv_import_file_path);
+            let import_is_excel = import_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_lowercase() == "xlsx")
+                .unwrap_or(false);
+
+            let result = if import_is_excel {
+                csv_handler.update_inventory_excel(&self.csv_import_file_path, &self.processing_results)
             } else {
-                csv_handler.update_inventory_csv(&path, &self.processing_results)
+                csv_handler.update_inventory_csv(&self.csv_import_file_path, &self.processing_results)
             };
-            
+
             if let Err(e) = result {
                 error!("Failed to update existing file: {}", e);
                 // Fallback to creating new file
@@ -1999,7 +2342,7 @@ impl AxisCameraApp {
                 } else {
                     csv_handler.write_inventory_report(&path, &self.processing_results)
                 };
-                
+
                 if let Err(e2) = fallback_result {
                     error!("Failed to create new file: {}", e2);
                 } else {
@@ -2015,7 +2358,7 @@ impl AxisCameraApp {
             } else {
                 csv_handler.write_inventory_report(&path, &self.processing_results)
             };
-            
+
             if let Err(e) = result {
                 error!("Failed to export results: {}", e);
             } else {

@@ -17,11 +17,11 @@ parking_lot = "0.12"
 byteorder = "1.5"
 serde = { version = "1.0", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12.21", features = ["json", "rustls-tls", "multipart"] }
+reqwest = { version = "0.12.21", features = ["json", "rustls-tls", "multipart", "stream"] }
 surge-ping = "0.8"  # Alternative to subprocess ping
 url = "2.5"
 base64 = "0.22"  # For HTTP digest auth if needed
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
 serde_json = "1.0"
 csv = "1.2"
 calamine = "0.24"  # Excel file reader/writer

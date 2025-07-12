@@ -1,11 +1,10 @@
-
 use anyhow::Result;
-use calamine::{ open_workbook, Reader, Xlsx, Data };
-use chrono::{ DateTime, Utc };
-use csv::{ ReaderBuilder, WriterBuilder };
-use log::{ error, info, warn };
-use rust_xlsxwriter::{ Workbook, Format };
-use serde::{ Deserialize, Serialize };
+use calamine::{open_workbook, Data, Reader, Xlsx};
+use chrono::{DateTime, Utc};
+use csv::{ReaderBuilder, WriterBuilder};
+use log::{error, info, warn};
+use rust_xlsxwriter::{Format, Workbook};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
@@ -14,49 +13,45 @@ use thiserror::Error;
 /// Custom error types for CSV operations
 #[derive(Error, Debug)]
 pub enum CsvError {
-    #[error("File not found: {path}")] FileNotFound {
-        path: String,
-    },
+    #[error("File not found: {path}")]
+    FileNotFound { path: String },
 
-    #[error("Duplicate IP addresses found: {ips}")] DuplicateIps {
-        ips: String,
-    },
+    #[error("Duplicate IP addresses found: {ips}")]
+    DuplicateIps { ips: String },
 
-    #[error("Duplicate MAC addresses found: {macs}")] DuplicateMacs {
-        macs: String,
-    },
+    #[error("Duplicate MAC addresses found: {macs}")]
+    DuplicateMacs { macs: String },
 
-    #[error("Invalid IP address format: {ip}")] InvalidIp {
-        ip: String,
-    },
+    #[error("Invalid IP address format: {ip}")]
+    InvalidIp { ip: String },
 
-    #[error("Invalid MAC address format: {mac}")] InvalidMac {
-        mac: String,
-    },
+    #[error("Invalid MAC address format: {mac}")]
+    InvalidMac { mac: String },
 
-    #[error("CSV parsing error: {message}")] ParseError {
-        message: String,
-    },
+    #[error("CSV parsing error: {message}")]
+    ParseError { message: String },
 
-    #[error("Validation error: {message}")] ValidationError {
-        message: String,
-    },
+    #[error("Validation error: {message}")]
+    ValidationError { message: String },
 
-    #[error("Invalid network configuration: {message}")] InvalidNetworkConfig {
-        message: String,
-    },
+    #[error("Invalid network configuration: {message}")]
+    InvalidNetworkConfig { message: String },
 
-    #[error("CSV error: {0}")] Csv(#[from] csv::Error),
+    #[error("CSV error: {0}")]
+    Csv(#[from] csv::Error),
 
-    #[error("IO error: {0}")] Io(#[from] std::io::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 
-    #[error("Serialization error: {0}")] Serialization(#[from] serde_json::Error),
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
 
-    #[error("Excel error: {0}")] Excel(#[from] calamine::Error),
+    #[error("Excel error: {0}")]
+    Excel(#[from] calamine::Error),
 
-    #[error("Excel writer error: {0}")] ExcelWriter(#[from] rust_xlsxwriter::XlsxError),
+    #[error("Excel writer error: {0}")]
+    ExcelWriter(#[from] rust_xlsxwriter::XlsxError),
 }
-
 
 /// Camera data structure for inventory reports
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -159,7 +154,7 @@ impl CsvHandler {
     /// of configuration results.
     pub fn import_camera_inventory<P: AsRef<Path>>(
         &self,
-        file_path: P
+        file_path: P,
     ) -> Result<Vec<CameraInventoryData>, CsvError> {
         let path_str = file_path.as_ref().to_string_lossy().to_string();
 
@@ -168,7 +163,10 @@ impl CsvHandler {
         }
 
         let file = File::open(&file_path)?;
-        let mut reader = ReaderBuilder::new().has_headers(true).flexible(true).from_reader(file);
+        let mut reader = ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .from_reader(file);
 
         let headers = reader.headers()?.clone();
         let header_index = Self::build_header_index(&headers);
@@ -189,25 +187,71 @@ impl CsvHandler {
             };
 
             // Extract all fields
-            let item_name = self.extract_field_with_index(&record, &header_index, &["item name", "camera model name", "model_name", "model"]);
-            let firmware_version = self.extract_field_with_index(&record, &header_index, &["firmware version", "firmware"]);
-            let mac_address = self.extract_field_with_index(&record, &header_index, &["mac address", "mac"]);
-            let serial = self.extract_field_with_index(&record, &header_index, &["serial #", "s/n", "serial", "serial number"]);
-            let ip_address = self.extract_field_with_index(&record, &header_index, &["ip address", "ip"]);
-            let subnet = self.extract_field_with_index(&record, &header_index, &["subnet", "subnet mask"]);
-            let gateway = self.extract_field_with_index(&record, &header_index, &["gateway", "gateway address"]);
-            let user_name = self.extract_field_with_index(&record, &header_index, &["user name", "admin user name(root)", "admin username", "username"]);
-            let password = self.extract_field_with_index(&record, &header_index, &["password", "admin(root) password", "admin password"]);
-            let device_map = self.extract_field_with_index(&record, &header_index, &["device map #", "device map"]);
-            let completion_time_str = self.extract_field_with_index(&record, &header_index, &["current time/date it was finish configuring", "completion time", "timestamp"]);
+            let item_name = self.extract_field_with_index(
+                &record,
+                &header_index,
+                &["item name", "camera model name", "model_name", "model"],
+            );
+            let firmware_version = self.extract_field_with_index(
+                &record,
+                &header_index,
+                &["firmware version", "firmware"],
+            );
+            let mac_address =
+                self.extract_field_with_index(&record, &header_index, &["mac address", "mac"]);
+            let serial = self.extract_field_with_index(
+                &record,
+                &header_index,
+                &["serial #", "s/n", "serial", "serial number"],
+            );
+            let ip_address =
+                self.extract_field_with_index(&record, &header_index, &["ip address", "ip"]);
+            let subnet =
+                self.extract_field_with_index(&record, &header_index, &["subnet", "subnet mask"]);
+            let gateway = self.extract_field_with_index(
+                &record,
+                &header_index,
+                &["gateway", "gateway address"],
+            );
+            let user_name = self.extract_field_with_index(
+                &record,
+                &header_index,
+                &[
+                    "user name",
+                    "admin user name(root)",
+                    "admin username",
+                    "username",
+                ],
+            );
+            let password = self.extract_field_with_index(
+                &record,
+                &header_index,
+                &["password", "admin(root) password", "admin password"],
+            );
+            let device_map = self.extract_field_with_index(
+                &record,
+                &header_index,
+                &["device map #", "device map"],
+            );
+            let completion_time_str = self.extract_field_with_index(
+                &record,
+                &header_index,
+                &[
+                    "current time/date it was finish configuring",
+                    "completion time",
+                    "timestamp",
+                ],
+            );
 
             // Skip rows without required fields
             let ip_address = match ip_address {
                 Some(ip_str) if !ip_str.trim().is_empty() => ip_str.trim().to_string(),
                 _ => {
-                    warn!("Skipping row {}: Missing or empty IP address. Check columns: {}", 
-                          row_number, 
-                          headers.iter().collect::<Vec<_>>().join(", "));
+                    warn!(
+                        "Skipping row {}: Missing or empty IP address. Check columns: {}",
+                        row_number,
+                        headers.iter().collect::<Vec<_>>().join(", ")
+                    );
                     row_number += 1;
                     continue;
                 }
@@ -258,11 +302,14 @@ impl CsvHandler {
             });
         }
 
-        info!("Successfully imported {} camera inventory records from {}", results.len(), path_str);
+        info!(
+            "Successfully imported {} camera inventory records from {}",
+            results.len(),
+            path_str
+        );
 
         Ok(results)
     }
-
 
     /// Write comprehensive inventory report to CSV file
     ///
@@ -280,7 +327,7 @@ impl CsvHandler {
     pub fn write_inventory_report<P: AsRef<Path>>(
         &self,
         file_path: P,
-        camera_data: &[CameraInventoryData]
+        camera_data: &[CameraInventoryData],
     ) -> Result<(), CsvError> {
         if camera_data.is_empty() {
             return Err(CsvError::ValidationError {
@@ -345,7 +392,7 @@ impl CsvHandler {
     pub fn update_inventory_csv<P: AsRef<Path>>(
         &self,
         file_path: P,
-        new_camera_data: &[CameraInventoryData]
+        new_camera_data: &[CameraInventoryData],
     ) -> Result<(), CsvError> {
         // First, try to read existing data
         let mut existing_data = match self.import_camera_inventory(&file_path) {
@@ -356,10 +403,12 @@ impl CsvHandler {
         // Update existing entries or add new ones
         for new_camera in new_camera_data {
             let mut updated = false;
-            
+
             // Try to find existing entry by MAC address first, then by IP
             for existing_camera in &mut existing_data {
-                if let (Some(existing_mac), Some(new_mac)) = (&existing_camera.mac_address, &new_camera.mac_address) {
+                if let (Some(existing_mac), Some(new_mac)) =
+                    (&existing_camera.mac_address, &new_camera.mac_address)
+                {
                     if existing_mac == new_mac {
                         *existing_camera = new_camera.clone();
                         updated = true;
@@ -371,7 +420,7 @@ impl CsvHandler {
                     break;
                 }
             }
-            
+
             // If not found, add as new entry
             if !updated {
                 existing_data.push(new_camera.clone());
@@ -425,7 +474,7 @@ impl CsvHandler {
     /// Import existing Excel (.xlsx) file with camera inventory data
     pub fn import_camera_inventory_excel<P: AsRef<Path>>(
         &self,
-        file_path: P
+        file_path: P,
     ) -> Result<Vec<CameraInventoryData>, CsvError> {
         let path_str = file_path.as_ref().to_string_lossy().to_string();
 
@@ -433,9 +482,10 @@ impl CsvHandler {
             return Err(CsvError::FileNotFound { path: path_str });
         }
 
-        let mut workbook: Xlsx<_> = open_workbook(&file_path).map_err(|e| CsvError::Excel(calamine::Error::Xlsx(e)))?;
+        let mut workbook: Xlsx<_> =
+            open_workbook(&file_path).map_err(|e| CsvError::Excel(calamine::Error::Xlsx(e)))?;
         let worksheet_names = workbook.sheet_names();
-        
+
         if worksheet_names.is_empty() {
             return Err(CsvError::ValidationError {
                 message: "Excel file contains no worksheets".to_string(),
@@ -444,7 +494,9 @@ impl CsvHandler {
 
         // Use the first worksheet
         let worksheet_name = &worksheet_names[0];
-        let range = workbook.worksheet_range(worksheet_name).map_err(|e| CsvError::Excel(calamine::Error::Xlsx(e)))?;
+        let range = workbook
+            .worksheet_range(worksheet_name)
+            .map_err(|e| CsvError::Excel(calamine::Error::Xlsx(e)))?;
 
         let mut results = Vec::new();
         let mut header_map = HashMap::new();
@@ -461,26 +513,60 @@ impl CsvHandler {
 
         // Process data rows (skip header row)
         for (row_idx, row) in range.rows().enumerate().skip(1) {
-            let item_name = self.extract_excel_field(row, &header_map, &["item name", "camera model name", "model_name", "model"]);
-            let firmware_version = self.extract_excel_field(row, &header_map, &["firmware version", "firmware"]);
+            let item_name = self.extract_excel_field(
+                row,
+                &header_map,
+                &["item name", "camera model name", "model_name", "model"],
+            );
+            let firmware_version =
+                self.extract_excel_field(row, &header_map, &["firmware version", "firmware"]);
             let mac_address = self.extract_excel_field(row, &header_map, &["mac address", "mac"]);
-            let serial = self.extract_excel_field(row, &header_map, &["serial #", "s/n", "serial", "serial number"]);
+            let serial = self.extract_excel_field(
+                row,
+                &header_map,
+                &["serial #", "s/n", "serial", "serial number"],
+            );
             let ip_address = self.extract_excel_field(row, &header_map, &["ip address", "ip"]);
             let subnet = self.extract_excel_field(row, &header_map, &["subnet", "subnet mask"]);
-            let gateway = self.extract_excel_field(row, &header_map, &["gateway", "gateway address"]);
-            let user_name = self.extract_excel_field(row, &header_map, &["user name", "admin user name(root)", "admin username", "username"]);
-            let password = self.extract_excel_field(row, &header_map, &["password", "admin(root) password", "admin password"]);
-            let device_map = self.extract_excel_field(row, &header_map, &["device map #", "device map"]);
-            let completion_time_str = self.extract_excel_field(row, &header_map, &["current time/date it was finish configuring", "completion time", "timestamp"]);
+            let gateway =
+                self.extract_excel_field(row, &header_map, &["gateway", "gateway address"]);
+            let user_name = self.extract_excel_field(
+                row,
+                &header_map,
+                &[
+                    "user name",
+                    "admin user name(root)",
+                    "admin username",
+                    "username",
+                ],
+            );
+            let password = self.extract_excel_field(
+                row,
+                &header_map,
+                &["password", "admin(root) password", "admin password"],
+            );
+            let device_map =
+                self.extract_excel_field(row, &header_map, &["device map #", "device map"]);
+            let completion_time_str = self.extract_excel_field(
+                row,
+                &header_map,
+                &[
+                    "current time/date it was finish configuring",
+                    "completion time",
+                    "timestamp",
+                ],
+            );
 
             // Skip rows without required fields
             let ip_address = match ip_address {
                 Some(ip_str) if !ip_str.trim().is_empty() => ip_str.trim().to_string(),
                 _ => {
                     let available_headers: Vec<String> = header_map.keys().cloned().collect();
-                    warn!("Skipping row {}: Missing or empty IP address. Available columns: {}", 
-                          row_idx + 1, 
-                          available_headers.join(", "));
+                    warn!(
+                        "Skipping row {}: Missing or empty IP address. Available columns: {}",
+                        row_idx + 1,
+                        available_headers.join(", ")
+                    );
                     continue;
                 }
             };
@@ -530,7 +616,10 @@ impl CsvHandler {
             });
         }
 
-        info!("Successfully imported {} camera inventory records from Excel file", results.len());
+        info!(
+            "Successfully imported {} camera inventory records from Excel file",
+            results.len()
+        );
         Ok(results)
     }
 
@@ -539,7 +628,7 @@ impl CsvHandler {
         &self,
         row: &[Data],
         header_map: &HashMap<String, usize>,
-        field_names: &[&str]
+        field_names: &[&str],
     ) -> Option<String> {
         for field_name in field_names {
             let normalized_field = field_name.to_lowercase();
@@ -562,7 +651,7 @@ impl CsvHandler {
     pub fn write_inventory_report_excel<P: AsRef<Path>>(
         &self,
         file_path: P,
-        camera_data: &[CameraInventoryData]
+        camera_data: &[CameraInventoryData],
     ) -> Result<(), CsvError> {
         if camera_data.is_empty() {
             return Err(CsvError::ValidationError {
@@ -581,7 +670,7 @@ impl CsvHandler {
         // Write headers
         let headers = [
             "Item Name",
-            "Firmware Version", 
+            "Firmware Version",
             "MAC Address",
             "Serial #",
             "IP Address",
@@ -599,7 +688,7 @@ impl CsvHandler {
         // Write data rows
         for (row_idx, camera) in camera_data.iter().enumerate() {
             let row = (row_idx + 1) as u32; // +1 to skip header row
-            
+
             let item_name_str = camera.item_name.as_deref().unwrap_or("");
             let firmware_version_str = camera.firmware_version.as_deref().unwrap_or("");
             let mac_address_str = camera.mac_address.as_deref().unwrap_or("");
@@ -618,7 +707,7 @@ impl CsvHandler {
             worksheet.write_string(row, 9, device_map_str)?;
         }
 
-        // Auto-fit columns  
+        // Auto-fit columns
         worksheet.autofit();
 
         workbook.save(&file_path)?;
@@ -636,7 +725,7 @@ impl CsvHandler {
     pub fn update_inventory_excel<P: AsRef<Path>>(
         &self,
         file_path: P,
-        new_camera_data: &[CameraInventoryData]
+        new_camera_data: &[CameraInventoryData],
     ) -> Result<(), CsvError> {
         // First, try to read existing data
         let mut existing_data = match self.import_camera_inventory_excel(&file_path) {
@@ -647,10 +736,12 @@ impl CsvHandler {
         // Update existing entries or add new ones
         for new_camera in new_camera_data {
             let mut updated = false;
-            
+
             // Try to find existing entry by MAC address first, then by IP
             for existing_camera in &mut existing_data {
-                if let (Some(existing_mac), Some(new_mac)) = (&existing_camera.mac_address, &new_camera.mac_address) {
+                if let (Some(existing_mac), Some(new_mac)) =
+                    (&existing_camera.mac_address, &new_camera.mac_address)
+                {
                     if existing_mac == new_mac {
                         *existing_camera = new_camera.clone();
                         updated = true;
@@ -662,7 +753,7 @@ impl CsvHandler {
                     break;
                 }
             }
-            
+
             // If not found, add as new entry
             if !updated {
                 existing_data.push(new_camera.clone());
@@ -689,7 +780,7 @@ impl CsvHandler {
         &self,
         record: &csv::StringRecord,
         header_index: &HashMap<String, usize>,
-        field_names: &[&str]
+        field_names: &[&str],
     ) -> Option<String> {
         for field_name in field_names {
             let normalized_field = field_name.to_lowercase();
@@ -708,14 +799,13 @@ impl CsvHandler {
         &self,
         record: &csv::StringRecord,
         headers: &csv::StringRecord,
-        field_names: &[&str]
+        field_names: &[&str],
     ) -> Option<String> {
         // For backward compatibility, build index each time
         // In practice, you'd build this once and reuse it
         let header_index = Self::build_header_index(headers);
         self.extract_field_with_index(record, &header_index, field_names)
     }
-
 }
 
 impl Default for CsvHandler {
